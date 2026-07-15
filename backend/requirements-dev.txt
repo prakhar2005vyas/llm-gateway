@@ -1,0 +1,12 @@
+# Test / dev dependencies (not installed in the runtime image)
+-r requirements.txt
+pytest>=8.2,<9
+pytest-asyncio>=0.23,<0.25
+respx>=0.21,<0.22
+openai>=1.30,<2
+# jiter pinned: 0.16.0's DLL is blocked by Windows Application Control on the
+# dev machine ("policy has blocked this file"); 0.8.2 imports fine. Test-env
+# only — jiter is an openai-SDK transitive dep, not gateway runtime code.
+jiter==0.8.2
+# In-memory SQLite driver so schema/DAL tests run with zero infrastructure.
+aiosqlite>=0.20,<0.22

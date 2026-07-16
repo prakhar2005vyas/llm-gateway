@@ -65,16 +65,21 @@ async def chat_completions(request: Request):
     if not isinstance(body, dict):
         return _error(400, "request body must be a JSON object", "invalid_request_error")
 
+    # Golden-dataset runner support: forces the eval sampling gate open for
+    # THIS request (rate/coin-flip bypassed; eligibility and shed cap still
+    # apply). Single-tenant tool — see evals.maybe_enqueue_eval.
+    force_eval = request.headers.get("x-gateway-force-eval") == "1"
+
     if body.get("stream"):
         return await _streamed(body)
-    return await _non_streamed(body)
+    return await _non_streamed(body, force_eval=force_eval)
 
 
 # ---------------------------------------------------------------------------
 # Non-streaming (Phase 1 behavior, unchanged)
 # ---------------------------------------------------------------------------
 
-async def _non_streamed(body: dict) -> JSONResponse:
+async def _non_streamed(body: dict, force_eval: bool = False) -> JSONResponse:
     started = time.perf_counter()
 
     # SPEC lifecycle steps 3-4: mask → embed → semantic cache lookup, all
@@ -158,6 +163,7 @@ async def _non_streamed(body: dict) -> JSONResponse:
             error_message=None,
             cache_decision=decision,  # miss + ok response → cold-path store
             coalesced=is_follower,  # follower → cost 0; leader carries spend
+            force_eval=force_eval,
         ),
     )
 

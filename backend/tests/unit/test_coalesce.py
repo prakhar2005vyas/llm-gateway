@@ -129,6 +129,84 @@ async def test_leader_failure_is_shared_then_next_flight_is_fresh():
     assert r == "ok" and is_leader and calls == 2
 
 
+async def test_leader_cancellation_does_not_kill_followers():
+    """C-1 audit fix: leader's client disconnects (task cancelled) while the
+    upstream flight is open — followers must still get the real result."""
+    coal = Coalescer()
+    calls = 0
+    release = asyncio.Event()
+
+    async def supplier():
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return {"answer": "survived"}
+
+    leader_task = asyncio.create_task(coal.get_or_run("k", supplier))
+    await asyncio.sleep(0)  # leader claims the key, flight opens
+    follower_tasks = [
+        asyncio.create_task(coal.get_or_run("k", supplier)) for _ in range(5)
+    ]
+    await asyncio.sleep(0)  # followers attach to the leader's future
+
+    leader_task.cancel()  # uvicorn: client went away
+    with pytest.raises(asyncio.CancelledError):
+        await leader_task
+
+    release.set()  # upstream finally answers
+    results = await asyncio.gather(*follower_tasks)
+
+    assert calls == 1  # ONE flight, despite the leader dying
+    assert all(r == {"answer": "survived"} for r, _ in results)
+    assert all(is_leader is False for _, is_leader in results)
+    assert coal.in_flight == 0  # map cleaned by the detached flight
+
+
+async def test_leader_cancellation_with_zero_followers_still_cleans_up():
+    coal = Coalescer()
+    release = asyncio.Event()
+
+    async def supplier():
+        await release.wait()
+        return "unobserved"
+
+    leader_task = asyncio.create_task(coal.get_or_run("k", supplier))
+    await asyncio.sleep(0)
+    leader_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader_task
+
+    release.set()
+    await asyncio.sleep(0.01)  # let the detached flight finish
+    assert coal.in_flight == 0  # no leaked pending entry
+
+
+async def test_cancelled_leader_failed_flight_shares_error_with_followers():
+    """Leader gone AND the flight fails: followers get the real upstream
+    error (not a hang, not a cancellation)."""
+    coal = Coalescer()
+    release = asyncio.Event()
+
+    async def failing_supplier():
+        await release.wait()
+        raise RuntimeError("upstream 503")
+
+    leader_task = asyncio.create_task(coal.get_or_run("k", failing_supplier))
+    await asyncio.sleep(0)
+    followers = [asyncio.create_task(coal.get_or_run("k", failing_supplier))
+                 for _ in range(3)]
+    await asyncio.sleep(0)
+
+    leader_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader_task
+
+    release.set()
+    results = await asyncio.gather(*followers, return_exceptions=True)
+    assert all(isinstance(r, RuntimeError) for r in results)
+    assert coal.in_flight == 0
+
+
 # ---------------------------------------------------------------------------
 # Guards + keying
 # ---------------------------------------------------------------------------

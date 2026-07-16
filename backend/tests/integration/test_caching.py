@@ -90,11 +90,28 @@ def pg_url():
 
 @pytest.fixture(autouse=True)
 async def _db(pg_url, monkeypatch):
-    """Point the app at the pgvector container; clean tables between tests."""
+    """Point the app at the pgvector container; clean tables between tests.
+
+    init_db retries: `pg_isready` inside the container reports ready during
+    the image's initdb phase (a TEMPORARY server that then restarts), so the
+    first host-side asyncpg connection can hit connection_lost. Only a real
+    connection through the forwarded port proves readiness.
+    """
     monkeypatch.setenv("DATABASE_URL", pg_url)
     get_settings.cache_clear()
     await dispose_db()
-    await init_db()
+    deadline = time_mod.time() + 30
+    while True:
+        try:
+            await init_db()
+            break
+        except (ConnectionError, OSError):
+            if time_mod.time() > deadline:
+                raise
+            await dispose_db()  # drop the poisoned engine before retrying
+            import asyncio
+
+            await asyncio.sleep(0.5)
     async with session() as s:
         await s.execute(delete(Trace))
         await s.execute(delete(SemanticCache))

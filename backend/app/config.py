@@ -90,6 +90,21 @@ class Settings(BaseSettings):
     # one result. Explicit temperature required; omitted = 1.0 = bypass.
     coalesce_max_temperature: float = 0.2
 
+    # --- Eval harness (Phase 6) -------------------------------------------------
+    # Fraction of successful traffic sampled for LLM-as-judge scoring.
+    # 0.0 = off (default: evals cost real tokens; opting in is explicit).
+    eval_sample_rate: float = 0.0
+    # OpenAI-compatible judge endpoint (e.g. Fireworks). Empty base URL =
+    # evaluator unconfigured → sampled evals recorded as status='skipped'.
+    eval_base_url: str = ""
+    eval_api_key: str = ""
+    eval_model_id: str = "accounts/fireworks/models/llama-v3p3-70b-instruct"
+    eval_timeout_seconds: float = 30.0
+    eval_max_retries: int = 1
+    # Max eval tasks in flight; beyond this, samples are SHED (bounded-queue
+    # rule: drop cold-path work before it can pile up into an OOM).
+    eval_max_concurrent: int = 4
+
     # --- Server --------------------------------------------------------------
     log_level: str = "INFO"
 

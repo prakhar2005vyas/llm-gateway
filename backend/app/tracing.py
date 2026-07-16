@@ -21,10 +21,24 @@ import uuid
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from . import cache
+from . import cache, evals
 from .costs import cost_for_model
 from .db import session
 from .models import ModelPrice, Trace
+
+
+def _response_content(response_body: dict | None) -> str | None:
+    """choices[0].message.content, defensively."""
+    if not isinstance(response_body, dict):
+        return None
+    choices = response_body.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    return content if isinstance(content, str) else None
 
 if TYPE_CHECKING:
     from .cache import CacheDecision
@@ -63,6 +77,7 @@ async def record_trace(
     ttft_ms: int | None = None,
     cache_decision: "CacheDecision | None" = None,
     coalesced: bool = False,
+    force_eval: bool = False,
 ) -> None:
     """Compute cost and persist one Trace row. Never raises.
 
@@ -124,6 +139,21 @@ async def record_trace(
                 )
             )
         logger.debug("trace %s recorded (model=%s outcome=%s)", trace_id, model_id, outcome)
+
+        # Phase 6: sampled LLM-as-judge eval — LAST cold-path stage, strictly
+        # after the trace commit (the FK needs the row; the client needed
+        # nothing from us long ago). One choke point covers both shapes:
+        # record_stream_trace flows through here too. Fire-and-forget with
+        # shed-at-cap inside; never blocks, never raises.
+        evals.maybe_enqueue_eval(
+            trace_id=trace_id,
+            request_body=request_body,
+            response_content=_response_content(response_body),
+            outcome=outcome,
+            cache_hit=is_cache_hit,
+            coalesced=coalesced,
+            force=force_eval,
+        )
     except Exception as exc:  # noqa: BLE001 — deliberate: see module docstring
         # DEGRADED STATE: the request succeeded but its trace is lost.
         # Class+message only — bodies may contain PII, they stay out of logs.

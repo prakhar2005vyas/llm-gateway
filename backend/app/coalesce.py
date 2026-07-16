@@ -116,6 +116,17 @@ class Coalescer:
         same key starts a fresh flight (coalescing is for concurrent
         duplicates; serving finished results to later requests is the
         semantic cache's job, with its own staleness rules).
+
+        Leader-cancellation isolation (C-1 audit fix): the supplier runs as
+        its own task behind asyncio.shield. If the LEADER's request is
+        cancelled (client disconnected → uvicorn cancels the handler), the
+        shield absorbs the cancellation at the leader's await point while
+        the upstream flight keeps running; followers receive the result as
+        if nothing happened. Only the leader's own response is lost — it
+        re-raises CancelledError for uvicorn to unwind. With zero followers
+        the flight still completes and settles the (now unobserved) future;
+        the wasted upstream call is the price of not special-casing, and
+        it's already paid for by the time cancellation can matter.
         """
         loop = asyncio.get_running_loop()
         new_future: asyncio.Future = loop.create_future()
@@ -126,21 +137,42 @@ class Coalescer:
             logger.debug("coalesced follower waiting (key=%s…)", key[:12])
             return await existing, False
 
-        # Leader: we own the flight.
+        # Leader: we own the flight. Run the supplier detached so OUR
+        # cancellation cannot become the flight's cancellation.
+        supplier_task = asyncio.create_task(self._run_flight(key, new_future, supplier))
+        # If the leader is cancelled and the flight later fails, nobody may
+        # await the task — consume its exception so asyncio never warns.
+        supplier_task.add_done_callback(
+            lambda t: None if t.cancelled() else t.exception()
+        )
+        try:
+            return await asyncio.shield(supplier_task), True
+        except asyncio.CancelledError:
+            logger.warning(
+                "coalescing leader cancelled mid-flight (key=%s…) — flight "
+                "continues for any followers", key[:12],
+            )
+            raise
+
+    async def _run_flight(
+        self, key: str, future: asyncio.Future, supplier: Callable[[], Awaitable[T]]
+    ) -> T:
+        """The actual upstream flight. Settles the shared future and cleans
+        the pending map in ALL exits — including leader-abandonment."""
         try:
             result = await supplier()
         except BaseException as exc:
             # Share the failure with every follower, then re-raise for our
             # own error path. Touching .exception() marks it retrieved so a
             # zero-follower flight can't emit "exception was never retrieved".
-            if not new_future.cancelled():
-                new_future.set_exception(exc)
-                new_future.exception()
+            if not future.cancelled():
+                future.set_exception(exc)
+                future.exception()
             raise
         else:
-            if not new_future.cancelled():
-                new_future.set_result(result)
-            return result, True
+            if not future.cancelled():
+                future.set_result(result)
+            return result
         finally:
             # Remove while holding the result — after this line the key is
             # free and a new flight may start; existing followers already

@@ -26,6 +26,22 @@ Classification of digit runs (after card/email exclusion):
 * anything else → left alone (years, prices, short ids)
 Known tradeoff: a hypothetical 13-digit Luhn-valid phone number would
 classify as a card — masked either way, only the label differs.
+
+SSNs (A-1 audit fix): US Social Security Numbers in the canonical
+NNN-NN-NNNN dashed form are detected as <SSN_n>. Undelimited 9-digit runs
+are NOT treated as SSNs — 9 digits with no structure is more often an
+order/tracking id, and false-positive masking corrupts prompts.
+
+ACCEPTED LIMITATIONS (documented, deliberate — see audit A-1):
+* Indian PAN card numbers (alphanumeric, e.g. ABCDE1234F) are NOT detected:
+  the pattern is 5 letters + 4 digits + 1 letter, which collides with too
+  many ordinary uppercase codes (invoice ids, ticket refs) for a regex-only
+  detector to separate safely. Masking them needs contextual NLP — that's
+  Presidio territory, rejected for weight (see above).
+* Aadhaar numbers (12 digits) are caught INCIDENTALLY by the phone range,
+  labeled <PHONE_n> — masked, mislabeled; acceptable for a redactor.
+* Names, physical addresses, dates of birth: out of scope for regex; same
+  Presidio tradeoff.
 """
 from __future__ import annotations
 
@@ -42,11 +58,14 @@ logger = logging.getLogger(__name__)
 # the same sensitivity as emails and must mask the same way. Over-matching an
 # @-address is the safe direction for a redactor.
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)*[A-Za-z0-9-]{2,}")
+# US SSN, canonical dashed form only (see module docstring for why
+# undelimited 9-digit runs are deliberately excluded).
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 # A digit run allowing common separators; optional leading + / ( so formats
 # like "(555) 123-4567" capture whole. Classified by digit count + Luhn.
 _NUMBER_RUN_RE = re.compile(r"\+?\(?\d(?:[\d\s().-]*\d)")
 
-_PLACEHOLDER_LABELS = {"EMAIL", "CARD", "PHONE"}
+_PLACEHOLDER_LABELS = {"EMAIL", "SSN", "CARD", "PHONE"}
 
 
 def _luhn_ok(digits: str) -> bool:
@@ -70,7 +89,7 @@ class _Match:
 
 
 def _detect(text: str) -> list[_Match]:
-    """All PII spans, non-overlapping, priority EMAIL > CARD > PHONE."""
+    """All PII spans, non-overlapping, priority EMAIL > SSN > CARD > PHONE."""
     matches: list[_Match] = []
 
     def overlaps(start: int, end: int) -> bool:
@@ -78,6 +97,10 @@ def _detect(text: str) -> list[_Match]:
 
     for m in _EMAIL_RE.finditer(text):
         matches.append(_Match(m.start(), m.end(), "EMAIL", m.group()))
+
+    for m in _SSN_RE.finditer(text):
+        if not overlaps(m.start(), m.end()):
+            matches.append(_Match(m.start(), m.end(), "SSN", m.group()))
 
     for m in _NUMBER_RUN_RE.finditer(text):
         if overlaps(m.start(), m.end()):

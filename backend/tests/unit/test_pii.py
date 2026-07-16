@@ -89,6 +89,43 @@ class TestPhones:
         assert pii == {}
 
 
+class TestSSN:
+    """A-1 audit fix: dashed US SSNs are detected; undelimited 9-digit runs
+    and Indian PAN are documented non-goals."""
+
+    def test_dashed_ssn_masked_and_reversible(self):
+        masked, pii = mask_text("my ssn is 123-45-6789, thanks")
+        assert masked == "my ssn is <SSN_1>, thanks"
+        assert pii == {"<SSN_1>": "123-45-6789"}
+        assert unmask_response("confirmed for <SSN_1>", pii) == (
+            "confirmed for 123-45-6789"
+        )
+
+    def test_undelimited_9_digits_is_not_an_ssn(self):
+        # 9 bare digits: order/tracking-id territory, deliberately untouched
+        # (also below the 10-digit phone floor).
+        masked, pii = mask_text("tracking 123456789 shipped")
+        assert masked == "tracking 123456789 shipped"
+        assert pii == {}
+
+    def test_ssn_and_phone_coexist(self):
+        masked, pii = mask_text("ssn 123-45-6789, cell 9876543210")
+        assert masked == "ssn <SSN_1>, cell <PHONE_1>"
+        assert pii["<SSN_1>"] == "123-45-6789"
+        assert pii["<PHONE_1>"] == "9876543210"
+
+    def test_pan_is_a_documented_limitation_not_detected(self):
+        # Indian PAN (alphanumeric) — ACCEPTED limitation per module
+        # docstring; this test pins the documented behavior so a future
+        # detector change is a conscious decision.
+        masked, pii = mask_text("my PAN is ABCDE1234F")
+        assert masked == "my PAN is ABCDE1234F"
+        assert pii == {}
+
+    def test_contains_pii_sees_ssn(self):
+        assert contains_pii("ssn: 123-45-6789")
+
+
 class TestMixedAndPriority:
     def test_all_three_types_in_one_text(self):
         text = (

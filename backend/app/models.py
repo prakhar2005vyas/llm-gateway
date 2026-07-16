@@ -40,6 +40,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     Numeric,
@@ -159,6 +160,50 @@ class ModelPrice(Base):
             f"<ModelPrice {self.model_id} in={self.usd_per_1k_input}"
             f" out={self.usd_per_1k_output}>"
         )
+
+
+class Eval(Base):
+    """One LLM-as-judge quality verdict for one sampled Trace (Phase 6).
+
+    `trace_id` is a REAL foreign key — the deliberate opposite of the
+    Trace→ModelPrice soft reference: an eval row without its trace is
+    meaningless noise, so referential enforcement is correct here.
+
+    Honesty note (SPEC): LLM-as-judge is NOISY. Scores are one sampled
+    model's opinion, stored with the evaluator's identity and raw verdict so
+    the noise is inspectable, never laundered into false precision.
+    """
+
+    __tablename__ = "evals"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    trace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("traces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False, index=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # 1-10 judge scores. Nullable: a failed/skipped eval has no scores, and
+    # NULL means "no verdict", never "scored zero".
+    helpfulness_score: Mapped[Decimal | None] = mapped_column(Numeric(4, 2), nullable=True)
+    tone_score: Mapped[Decimal | None] = mapped_column(Numeric(4, 2), nullable=True)
+
+    evaluator_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # pending → completed | failed | skipped (skipped = no evaluator
+    # configured / shed under load — visible, not silently dropped).
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The judge's raw JSON verdict, for auditing the noise.
+    raw_verdict: Mapped[dict | None] = mapped_column(nullable=True)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<Eval {self.id} trace={self.trace_id} status={self.status}>"
 
 
 class SemanticCache(Base):

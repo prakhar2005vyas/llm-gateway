@@ -59,13 +59,20 @@ def pg_url():
         pytest.skip("docker not installed/responding — set CACHE_TEST_PG_URL to run")
 
     _docker("rm", "-f", CONTAINER)  # stale leftover from an aborted run
-    started = _docker(
-        "run", "--rm", "-d", "--name", CONTAINER,
-        "-e", "POSTGRES_PASSWORD=cachetest",
-        "-e", "POSTGRES_DB=cachetest",
-        "-p", f"{PORT}:5432",
-        "pgvector/pgvector:pg15",
-    )
+    # Retry once: back-to-back suite runs can race the previous container's
+    # port release (docker stop is asynchronous with --rm cleanup).
+    for attempt in (1, 2):
+        started = _docker(
+            "run", "--rm", "-d", "--name", CONTAINER,
+            "-e", "POSTGRES_PASSWORD=cachetest",
+            "-e", "POSTGRES_DB=cachetest",
+            "-p", f"{PORT}:5432",
+            "pgvector/pgvector:pg15",
+        )
+        if started.returncode == 0:
+            break
+        _docker("rm", "-f", CONTAINER)
+        time_mod.sleep(3)
     assert started.returncode == 0, f"container failed to start: {started.stderr}"
     try:
         deadline = time_mod.time() + 60

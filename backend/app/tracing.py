@@ -62,6 +62,7 @@ async def record_trace(
     error_message: str | None = None,
     ttft_ms: int | None = None,
     cache_decision: "CacheDecision | None" = None,
+    coalesced: bool = False,
 ) -> None:
     """Compute cost and persist one Trace row. Never raises.
 
@@ -88,10 +89,12 @@ async def record_trace(
         prompt_tokens, completion_tokens, total_tokens = _extract_usage(response_body)
 
         async with session() as s:
-            if is_cache_hit:
-                # No upstream call happened: cost is a LITERAL zero (honest
-                # "free", distinct from NULL "unknown"), tokens stay NULL
-                # (nothing was consumed upstream on this request).
+            if is_cache_hit or coalesced:
+                # No upstream call happened FOR THIS REQUEST (cache hit, or
+                # coalesced follower sharing the leader's call): cost is a
+                # LITERAL zero (honest "free", distinct from NULL "unknown"),
+                # tokens stay NULL — the leader's trace carries the real
+                # spend exactly once.
                 cost = Decimal("0")
                 prompt_tokens = completion_tokens = total_tokens = None
             else:
@@ -114,6 +117,7 @@ async def record_trace(
                     total_tokens=total_tokens,
                     cost_usd=cost,
                     cache_hit=is_cache_hit,
+                    coalesced=coalesced,
                     outcome=outcome,
                     error_message=error_message,
                     ttft_ms=ttft_ms,
@@ -138,6 +142,7 @@ async def record_trace(
         await cache.record_hit(cache_decision.hit.id)
     elif (
         outcome == "ok"
+        and not coalesced  # the leader stores once; followers would only re-upsert
         and cache_decision.cacheable
         and cache_decision.masked_prompt is not None
         and cache_decision.embedding is not None

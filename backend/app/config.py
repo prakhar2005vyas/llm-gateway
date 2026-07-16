@@ -28,6 +28,21 @@ class Settings(BaseSettings):
     # Number of *retries* after the first attempt (so total tries = retries + 1).
     upstream_max_retries: int = 2
 
+    # --- Failover (Phase 4) ----------------------------------------------------
+    # Secondary OpenAI-compatible provider (same schema = swap base URL + key).
+    # Used only after the primary exhausts ALL its retries with transport
+    # errors or 5xx. Empty = failover disabled. Cross-schema (Anthropic)
+    # failover is DOCUMENT-ONLY in SCALING.md.
+    failover_base_url: str = ""
+    failover_api_key: str = ""
+
+    # --- Rate limiting (Phase 4) -------------------------------------------------
+    # In-memory per-key sliding window (v1, single-process; distributed
+    # counters are SCALING.md material). Key = client bearer token.
+    rate_limit_enabled: bool = True
+    rate_limit_requests: int = 60
+    rate_limit_window_seconds: float = 60.0
+
     # --- Gateway auth (optional in Phase 0) ----------------------------------
     # Empty string => auth disabled (transparent pass-through).
     gateway_api_key: str = ""
@@ -68,6 +83,12 @@ class Settings(BaseSettings):
     # is a correctness bug. Requests without an explicit temperature default
     # to 1.0 upstream → not cacheable.
     cache_max_temperature: float = 0.2
+
+    # --- Request coalescing (Phase 4) ------------------------------------------
+    coalesce_enabled: bool = True
+    # Same correctness rule as caching: only deterministic requests may share
+    # one result. Explicit temperature required; omitted = 1.0 = bypass.
+    coalesce_max_temperature: float = 0.2
 
     # --- Server --------------------------------------------------------------
     log_level: str = "INFO"

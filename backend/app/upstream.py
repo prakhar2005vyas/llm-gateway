@@ -43,43 +43,110 @@ def _backoff_seconds(attempt: int) -> float:
     return min(0.5 * (2**attempt), 8.0)
 
 
-async def forward_chat_completion(body: dict) -> tuple[int, dict]:
-    """Forward a chat-completions request upstream and return (status, json).
+@dataclass(frozen=True)
+class Provider:
+    """One OpenAI-compatible target. Same schema = swap base URL + key."""
 
-    Retries transient transport errors and 5xx responses up to
-    `UPSTREAM_MAX_RETRIES` times. A non-5xx HTTP response (including 4xx) is
-    forwarded transparently — the gateway does not mask the provider's own
-    client errors.
+    name: str
+    base_url: str
+    api_key: str
+
+    @property
+    def chat_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/chat/completions"
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+
+def providers() -> list[Provider]:
+    """Failover chain: primary, then the optional secondary (Phase 4).
+
+    Each provider gets its FULL retry budget before the chain advances.
+    Cross-schema targets (Anthropic) need a translation layer — DOCUMENT-ONLY.
     """
+    s = get_settings()
+    chain = [Provider("primary", s.upstream_base_url, s.upstream_api_key)]
+    if s.failover_base_url:
+        chain.append(Provider("failover", s.failover_base_url, s.failover_api_key))
+    return chain
+
+
+async def forward_chat_completion(body: dict) -> tuple[int, dict]:
+    """Forward through the provider chain and return (status, json).
+
+    Per provider: retries transport errors and 5xx with backoff (Phase 0
+    behavior, unchanged). When the PRIMARY fails completely — transport
+    errors exhausted, or still 5xx on its final attempt — the request
+    reroutes to the failover provider, which gets its own retry budget.
+
+    A 4xx NEVER advances the chain: it's the client's error and retargeting
+    it would just replay a bad request (and mask the provider's message).
+    Only when every provider is down: the last 5xx body is returned
+    transparently if one exists, else UpstreamError → the route's clean 502.
+    """
+    last_exc: Exception | None = None
+    last_5xx: tuple[int, dict] | None = None
+    chain = providers()
+
+    for provider in chain:
+        is_last = provider is chain[-1]
+        try:
+            status, payload = await _forward_via(provider, body)
+        except UpstreamError as exc:
+            last_exc = exc
+            if not is_last:
+                logger.error(
+                    "provider %r unreachable after all retries — FAILING OVER: %s",
+                    provider.name, exc,
+                )
+            continue
+        if status >= 500 and not is_last:
+            last_5xx = (status, payload)
+            logger.error(
+                "provider %r still %d after all retries — FAILING OVER",
+                provider.name, status,
+            )
+            continue
+        if provider.name != "primary":
+            logger.warning("request served by %r provider", provider.name)
+        return status, payload
+
+    if last_5xx is not None:
+        return last_5xx
+    raise UpstreamError(
+        f"all {len(chain)} provider(s) unreachable: {last_exc}"
+    ) from last_exc
+
+
+async def _forward_via(provider: Provider, body: dict) -> tuple[int, dict]:
+    """One provider, full retry budget (transport errors + 5xx, backoff)."""
     settings = get_settings()
-    url = settings.chat_completions_url
-    headers = {
-        "Authorization": f"Bearer {settings.upstream_api_key}",
-        "Content-Type": "application/json",
-    }
     max_tries = settings.upstream_max_retries + 1
     last_exc: Exception | None = None
 
     async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:
         for attempt in range(max_tries):
             try:
-                resp = await client.post(url, json=body, headers=headers)
+                resp = await client.post(
+                    provider.chat_url, json=body, headers=provider.headers
+                )
             except _RETRYABLE_EXC as exc:
                 last_exc = exc
                 logger.warning(
-                    "upstream network error (attempt %d/%d): %s",
-                    attempt + 1,
-                    max_tries,
-                    exc,
+                    "%s network error (attempt %d/%d): %s",
+                    provider.name, attempt + 1, max_tries, exc,
                 )
             else:
                 # Retry server errors; forward everything else as-is.
                 if resp.status_code >= 500 and attempt < max_tries - 1:
                     logger.warning(
-                        "upstream %d (attempt %d/%d), retrying",
-                        resp.status_code,
-                        attempt + 1,
-                        max_tries,
+                        "%s %d (attempt %d/%d), retrying",
+                        provider.name, resp.status_code, attempt + 1, max_tries,
                     )
                 else:
                     return resp.status_code, _safe_json(resp)
@@ -88,7 +155,7 @@ async def forward_chat_completion(body: dict) -> tuple[int, dict]:
                 await asyncio.sleep(_backoff_seconds(attempt))
 
     raise UpstreamError(
-        f"upstream unreachable after {max_tries} attempts: {last_exc}"
+        f"{provider.name} unreachable after {max_tries} attempts: {last_exc}"
     ) from last_exc
 
 
@@ -200,55 +267,82 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
     * A non-2xx final status yields the upstream's error body as plain JSON
       bytes (result.status_code carries it; the route sets the real HTTP
       status from it before streaming starts).
-    * Raises UpstreamError only when the connection phase exhausted retries.
+    * Failover (Phase 4): applies to the CONNECTION phase only, under the
+      exact same replay-safety rule as retries — once the first byte has been
+      relayed, neither retry nor provider switch is possible. A dead primary
+      (transport-exhausted or final-5xx) hands off to the failover provider
+      with a fresh retry budget. 4xx never advances the chain.
+    * Raises UpstreamError only when every provider exhausted its retries.
     """
     settings = get_settings()
-    url = settings.chat_completions_url
-    headers = {
-        "Authorization": f"Bearer {settings.upstream_api_key}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    }
     max_tries = settings.upstream_max_retries + 1
     last_exc: Exception | None = None
+    chain = providers()
 
-    async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:
-        for attempt in range(max_tries):
-            try:
-                async with client.stream("POST", url, json=body, headers=headers) as resp:
-                    if resp.status_code >= 500 and attempt < max_tries - 1:
-                        await resp.aread()  # drain; do NOT relay a retryable 5xx
-                        logger.warning(
-                            "stream upstream %d (attempt %d/%d), retrying",
-                            resp.status_code, attempt + 1, max_tries,
-                        )
-                    elif resp.status_code >= 400:
-                        # Terminal error status: relay body as-is, no retry.
-                        result.status_code = resp.status_code
-                        yield await resp.aread()
+    for provider in chain:
+        is_last = provider is chain[-1]
+        headers = dict(provider.headers, Accept="text/event-stream")
+        failed_over = False
+
+        async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:
+            for attempt in range(max_tries):
+                try:
+                    async with client.stream(
+                        "POST", provider.chat_url, json=body, headers=headers
+                    ) as resp:
+                        if resp.status_code >= 500 and attempt < max_tries - 1:
+                            await resp.aread()  # drain; do NOT relay a retryable 5xx
+                            logger.warning(
+                                "stream %s %d (attempt %d/%d), retrying",
+                                provider.name, resp.status_code, attempt + 1, max_tries,
+                            )
+                        elif resp.status_code >= 500 and not is_last:
+                            # Provider exhausted on 5xx → next provider.
+                            await resp.aread()
+                            logger.error(
+                                "stream: provider %r still %d after all retries "
+                                "— FAILING OVER", provider.name, resp.status_code,
+                            )
+                            failed_over = True
+                            break
+                        elif resp.status_code >= 400:
+                            # Terminal error status: relay body as-is, no retry.
+                            result.status_code = resp.status_code
+                            yield await resp.aread()
+                            return
+                        else:
+                            if provider.name != "primary":
+                                logger.warning(
+                                    "stream served by %r provider", provider.name
+                                )
+                            result.status_code = resp.status_code
+                            async for chunk in _relay(resp, result):
+                                yield chunk
+                            return
+                except _RETRYABLE_EXC as exc:
+                    if result.status_code is not None:
+                        # Bytes already relayed — mid-stream failure: no
+                        # retry, no failover (replay would corrupt the client).
+                        result.error = f"stream interrupted: {type(exc).__name__}: {exc}"
+                        logger.error("stream interrupted after %d event(s): %s",
+                                     result.events_seen, exc)
                         return
-                    else:
-                        result.status_code = resp.status_code
-                        async for chunk in _relay(resp, result):
-                            yield chunk
-                        return
-            except _RETRYABLE_EXC as exc:
-                if result.status_code is not None:
-                    # Bytes already relayed — mid-stream failure, no retry.
-                    result.error = f"stream interrupted: {type(exc).__name__}: {exc}"
-                    logger.error("stream interrupted after %d event(s): %s",
-                                 result.events_seen, exc)
-                    return
-                last_exc = exc
-                logger.warning(
-                    "stream connect error (attempt %d/%d): %s",
-                    attempt + 1, max_tries, exc,
-                )
-            if attempt < max_tries - 1:
-                await asyncio.sleep(_backoff_seconds(attempt))
+                    last_exc = exc
+                    logger.warning(
+                        "stream %s connect error (attempt %d/%d): %s",
+                        provider.name, attempt + 1, max_tries, exc,
+                    )
+                if attempt < max_tries - 1:
+                    await asyncio.sleep(_backoff_seconds(attempt))
+
+        if not is_last and not failed_over:
+            logger.error(
+                "stream: provider %r unreachable after all retries — FAILING OVER: %s",
+                provider.name, last_exc,
+            )
 
     raise UpstreamError(
-        f"upstream unreachable after {max_tries} attempts: {last_exc}"
+        f"all {len(chain)} provider(s) unreachable for stream: {last_exc}"
     ) from last_exc
 
 

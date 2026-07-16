@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from .. import cache
+from .. import cache, coalesce, ratelimit
 from ..auth import require_gateway_key
 from ..tracing import record_stream_trace, record_trace
 from ..upstream import (
@@ -41,6 +41,21 @@ router = APIRouter()
 
 @router.post("/v1/chat/completions", dependencies=[Depends(require_gateway_key)])
 async def chat_completions(request: Request):
+    # SPEC lifecycle step 2: per-key rate limit, before any work is spent on
+    # the request. The check is in-memory and awaits nothing — an over-limit
+    # burst costs O(1) per rejection and cannot degrade within-limit traffic.
+    decision = ratelimit.limiter.check(
+        ratelimit.client_key(request.headers.get("authorization"))
+    )
+    if not decision.allowed:
+        return _error(
+            429,
+            "rate limit exceeded: retry after "
+            f"{decision.retry_after_seconds}s",
+            "rate_limit_error",
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
+
     try:
         body = await request.json()
     except ValueError:
@@ -83,8 +98,21 @@ async def _non_streamed(body: dict) -> JSONResponse:
             ),
         )
 
+    # SPEC lifecycle step 5: exact-match coalescing. Concurrent identical
+    # (deterministic) requests collapse into ONE upstream call — the leader
+    # forwards, followers await its future and share the result. get_or_run's
+    # dict.setdefault is the atomic compare-and-set; a leader failure is
+    # shared with every follower and lands in the same except-arm below.
+    is_follower = False
     try:
-        status_code, payload = await forward_chat_completion(body)
+        if coalesce.is_coalesceable(body):
+            (status_code, payload), is_leader = await coalesce.coalescer.get_or_run(
+                coalesce.request_key(body),
+                lambda: forward_chat_completion(body),
+            )
+            is_follower = not is_leader
+        else:
+            status_code, payload = await forward_chat_completion(body)
     except UpstreamError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.error("forward failed: %s", exc)
@@ -117,6 +145,7 @@ async def _non_streamed(body: dict) -> JSONResponse:
             outcome="ok" if status_code < 400 else "upstream_error",
             error_message=None,
             cache_decision=decision,  # miss + ok response → cold-path store
+            coalesced=is_follower,  # follower → cost 0; leader carries spend
         ),
     )
 
@@ -190,10 +219,12 @@ def _error(
     message: str,
     err_type: str,
     background: BackgroundTask | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """Return an OpenAI-shaped error object so SDK clients parse it cleanly."""
     return JSONResponse(
         status_code=status_code,
         content={"error": {"message": message, "type": err_type}},
         background=background,
+        headers=headers,
     )

@@ -114,6 +114,11 @@ class Trace(Base):
     # upstream calls, cost_usd is an honest 0 (actually free, not unknown).
     cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # True when this request was a coalesced FOLLOWER sharing the leader's
+    # single upstream call. Cost/tokens are 0/NULL on followers — the leader's
+    # trace carries the real spend exactly once, so aggregates stay truthful.
+    coalesced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     # Honest failure surface: 'ok' | 'upstream_error' | 'inconclusive' — a
     # trace that failed mid-flight is still a trace (never silently dropped).
     outcome: Mapped[str] = mapped_column(String(32), nullable=False, default="ok")

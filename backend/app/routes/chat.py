@@ -1,26 +1,38 @@
 """OpenAI-compatible chat-completions endpoint.
 
-Phase 1: transparent non-streaming pass-through + the hot/cold seam.
-The hot path is: parse → forward → return. The Trace write (cost calc +
-Postgres insert) rides a starlette BackgroundTask attached to the response,
-which Starlette runs only after the response body has been flushed to the
-client — the client never waits on the database (SPEC.md lifecycle step 8).
+Phase 2: transparent pass-through for BOTH shapes. Non-streaming: forward,
+return JSON. Streaming: relay raw SSE bytes as they arrive (StreamingResponse)
+while a tap reassembles the full text for the trace.
 
-Streaming lands in Phase 2; until then `stream: true` gets a clean, explicit
-error instead of a half-working response.
+Hot/cold seam (SPEC.md step 8) in both branches: the Trace write rides a
+starlette BackgroundTask attached to the response. For streams, Starlette runs
+it only after the generator is fully drained — so the StreamResult it reads is
+complete, and the client never waits on Postgres.
+
+TTFT: the route awaits the FIRST upstream chunk before constructing the
+StreamingResponse. That timestamp is time-to-first-token, and it also means a
+connect-phase failure still becomes a clean 502 JSON error (HTTP status must
+be decided before the first byte is sent; it cannot change mid-stream).
 """
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from .. import cache
 from ..auth import require_gateway_key
-from ..tracing import record_trace
-from ..upstream import UpstreamError, forward_chat_completion
+from ..tracing import record_stream_trace, record_trace
+from ..upstream import (
+    StreamResult,
+    UpstreamError,
+    forward_chat_completion,
+    forward_stream,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +40,7 @@ router = APIRouter()
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(require_gateway_key)])
-async def chat_completions(request: Request) -> JSONResponse:
+async def chat_completions(request: Request):
     try:
         body = await request.json()
     except ValueError:
@@ -38,21 +50,44 @@ async def chat_completions(request: Request) -> JSONResponse:
         return _error(400, "request body must be a JSON object", "invalid_request_error")
 
     if body.get("stream"):
-        # Honest degraded state rather than pretending it works (CLAUDE.md).
-        return _error(
-            400,
-            "streaming is not supported yet (arrives in Phase 2); "
-            "retry with stream=false",
-            "invalid_request_error",
+        return await _streamed(body)
+    return await _non_streamed(body)
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming (Phase 1 behavior, unchanged)
+# ---------------------------------------------------------------------------
+
+async def _non_streamed(body: dict) -> JSONResponse:
+    started = time.perf_counter()
+
+    # SPEC lifecycle steps 3-4: mask → embed → semantic cache lookup, all
+    # before any upstream call. A hit short-circuits the request entirely:
+    # the cached body goes straight back, zero upstream calls, $0. consult()
+    # never raises — cache trouble degrades to a miss.
+    decision = await cache.consult(body)
+    if decision.hit is not None:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return JSONResponse(
+            status_code=200,
+            content=decision.hit.response_body,
+            headers={"x-gateway-cache": "hit"},
+            background=BackgroundTask(
+                record_trace,
+                request_body=body,
+                response_body=decision.hit.response_body,
+                status_code=200,
+                latency_ms=latency_ms,
+                outcome="ok",
+                cache_decision=decision,  # → cache_hit=True, cost=0, hit stats
+            ),
         )
 
-    started = time.perf_counter()
     try:
         status_code, payload = await forward_chat_completion(body)
     except UpstreamError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.error("forward failed: %s", exc)
-        # A failed forward is still an observability event — trace it too.
         return _error(
             502,
             f"upstream provider unavailable: {exc}",
@@ -69,13 +104,10 @@ async def chat_completions(request: Request) -> JSONResponse:
         )
 
     latency_ms = int((time.perf_counter() - started) * 1000)
-
-    # HOT PATH ENDS HERE. The trace write (cost lookup + Postgres insert)
-    # runs after this response is flushed; a DB failure can no longer touch
-    # the client (record_trace never raises — see tracing.py).
     return JSONResponse(
         status_code=status_code,
         content=payload,
+        headers={"x-gateway-cache": "miss"} if decision.cacheable else None,
         background=BackgroundTask(
             record_trace,
             request_body=body,
@@ -84,7 +116,72 @@ async def chat_completions(request: Request) -> JSONResponse:
             latency_ms=latency_ms,
             outcome="ok" if status_code < 400 else "upstream_error",
             error_message=None,
+            cache_decision=decision,  # miss + ok response → cold-path store
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming (Phase 2)
+# ---------------------------------------------------------------------------
+
+async def _streamed(body: dict):
+    started = time.perf_counter()
+    result = StreamResult()
+    upstream_gen = forward_stream(body, result)
+
+    # Await the first chunk BEFORE building the response: this is both the
+    # TTFT measurement point and the last moment the HTTP status can change.
+    try:
+        first_chunk = await anext(upstream_gen)
+    except StopAsyncIteration:
+        first_chunk = None  # upstream closed with an empty body
+    except UpstreamError as exc:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        logger.error("stream connect failed: %s", exc)
+        result.error = str(exc)
+        result.status_code = 502
+        return _error(
+            502,
+            f"upstream provider unavailable: {exc}",
+            "gateway_error",
+            background=BackgroundTask(
+                record_stream_trace,
+                request_body=body,
+                result=result,
+                latency_ms=latency_ms,
+            ),
+        )
+
+    result.ttft_ms = int((time.perf_counter() - started) * 1000)
+    status_code = result.status_code or 502
+
+    async def relay() -> AsyncIterator[bytes]:
+        if first_chunk is not None:
+            yield first_chunk
+        async for chunk in upstream_gen:
+            yield chunk
+
+    # Non-2xx: upstream rejected the request before streaming (auth, quota,
+    # bad model...). forward_stream yielded its error body as plain bytes —
+    # relay it under the true status, as JSON, not as an event stream.
+    media_type = "text/event-stream" if status_code < 400 else "application/json"
+
+    async def trace_when_drained() -> None:
+        # BackgroundTask args bind at construction time, but total latency
+        # only exists once the stream has drained — so it's computed HERE,
+        # when Starlette runs the task after the response completes.
+        await record_stream_trace(
+            request_body=body,
+            result=result,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    return StreamingResponse(
+        relay(),
+        status_code=status_code,
+        media_type=media_type,
+        background=BackgroundTask(trace_when_drained),
     )
 
 

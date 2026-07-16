@@ -11,3 +11,12 @@ tenacity>=8.4,<10
 # Phase 1 — data access layer (Postgres, async)
 sqlalchemy[asyncio]>=2.0.30,<2.1
 asyncpg>=0.29,<0.31
+
+# Phase 3 — semantic cache (pgvector column type + query operators)
+pgvector>=0.2.5,<0.4
+
+# Phase 3 — local CPU embeddings. Torch is pulled in by sentence-transformers;
+# the Dockerfile installs the CPU-only torch wheel FIRST (see backend/Dockerfile)
+# so the image never ships CUDA libraries (~2GB saved, and no GPU assumptions —
+# CLAUDE.md: must run on a GPU-less machine).
+sentence-transformers>=3.0,<4

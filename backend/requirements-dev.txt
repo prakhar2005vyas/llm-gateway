@@ -8,5 +8,9 @@ openai>=1.30,<2
 # dev machine ("policy has blocked this file"); 0.8.2 imports fine. Test-env
 # only — jiter is an openai-SDK transitive dep, not gateway runtime code.
 jiter==0.8.2
+# scipy pinned for the same Application Control reason (1.18.0's qhull DLL is
+# blocked; 1.14.1 imports fine). Transitive dep of sentence-transformers.
+# Dev-machine constraint only — the Linux container is unaffected.
+scipy==1.14.1
 # In-memory SQLite driver so schema/DAL tests run with zero infrastructure.
 aiosqlite>=0.20,<0.22

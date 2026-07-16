@@ -16,13 +16,19 @@ Failure contract (non-negotiable):
 from __future__ import annotations
 
 import logging
+import time
 import uuid
+from decimal import Decimal
+from typing import TYPE_CHECKING
 
-from sqlalchemy import select
-
+from . import cache
 from .costs import cost_for_model
 from .db import session
 from .models import ModelPrice, Trace
+
+if TYPE_CHECKING:
+    from .cache import CacheDecision
+    from .upstream import StreamResult
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +60,20 @@ async def record_trace(
     latency_ms: int | None,
     outcome: str,
     error_message: str | None = None,
+    ttft_ms: int | None = None,
+    cache_decision: "CacheDecision | None" = None,
 ) -> None:
-    """Compute cost and persist one Trace row. Never raises."""
+    """Compute cost and persist one Trace row. Never raises.
+
+    `cache_decision` carries the hot path's cache consultation:
+    * hit  → trace records cache_hit=True with cost_usd = literal 0 (truly
+      free — no upstream call happened; 0 here is honest, unlike unknowns),
+      and the entry's hit stats are bumped.
+    * miss → on a successful, storable response, the (already-masked,
+      already-embedded) prompt and the response are inserted into the cache.
+    """
     trace_id = uuid.uuid4()
+    is_cache_hit = cache_decision is not None and cache_decision.hit is not None
     try:
         # The client asked for this model id, and the price table is keyed by
         # what clients ask for ("gpt-4o-mini"), not the resolved snapshot id
@@ -71,12 +88,18 @@ async def record_trace(
         prompt_tokens, completion_tokens, total_tokens = _extract_usage(response_body)
 
         async with session() as s:
-            price_row = None
-            if model_id is not None:
-                price_row = await s.get(ModelPrice, model_id)
-            prices = {price_row.model_id: price_row} if price_row else {}
-
-            cost = cost_for_model(model_id, prompt_tokens, completion_tokens, prices)
+            if is_cache_hit:
+                # No upstream call happened: cost is a LITERAL zero (honest
+                # "free", distinct from NULL "unknown"), tokens stay NULL
+                # (nothing was consumed upstream on this request).
+                cost = Decimal("0")
+                prompt_tokens = completion_tokens = total_tokens = None
+            else:
+                price_row = None
+                if model_id is not None:
+                    price_row = await s.get(ModelPrice, model_id)
+                prices = {price_row.model_id: price_row} if price_row else {}
+                cost = cost_for_model(model_id, prompt_tokens, completion_tokens, prices)
 
             s.add(
                 Trace(
@@ -90,8 +113,10 @@ async def record_trace(
                     completion_tokens=completion_tokens,
                     total_tokens=total_tokens,
                     cost_usd=cost,
+                    cache_hit=is_cache_hit,
                     outcome=outcome,
                     error_message=error_message,
+                    ttft_ms=ttft_ms,
                 )
             )
         logger.debug("trace %s recorded (model=%s outcome=%s)", trace_id, model_id, outcome)
@@ -104,3 +129,114 @@ async def record_trace(
             type(exc).__name__,
             exc,
         )
+
+    # Cache bookkeeping AFTER the trace attempt, isolated from it — each of
+    # these owns its own never-raise boundary.
+    if cache_decision is None:
+        return
+    if is_cache_hit:
+        await cache.record_hit(cache_decision.hit.id)
+    elif (
+        outcome == "ok"
+        and cache_decision.cacheable
+        and cache_decision.masked_prompt is not None
+        and cache_decision.embedding is not None
+        and isinstance(request_body, dict)
+        and cache.is_storable_response(response_body)
+    ):
+        await cache.store(
+            model_id=request_body["model"],
+            masked_prompt=cache_decision.masked_prompt,
+            embedding=cache_decision.embedding,
+            response_body=response_body,  # type: ignore[arg-type]
+        )
+
+
+async def record_stream_trace(
+    *,
+    request_body: dict | None,
+    result: "StreamResult",
+    latency_ms: int,
+) -> None:
+    """Trace one streamed request from its populated StreamResult.
+
+    Runs as a BackgroundTask — Starlette executes it only after the
+    StreamingResponse has fully drained the generator, so `result` is
+    complete by the time this reads it (no synchronization needed).
+
+    The trace's response_body is SYNTHESIZED: streams have no single JSON
+    response, so we store the reassembled content in OpenAI response shape,
+    tagged "gateway.reassembled": true so nobody mistakes it for upstream's
+    literal bytes. usage is included only if the provider sent it.
+    """
+    ok = result.error is None and (result.status_code or 0) < 400
+    if result.error is not None:
+        outcome = "inconclusive"  # stream started but ended abnormally
+    elif ok:
+        outcome = "ok"
+    else:
+        outcome = "upstream_error"
+
+    response_body: dict = {
+        "object": "chat.completion",
+        "gateway.reassembled": True,
+        "model": result.model_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": result.content},
+                "finish_reason": result.finish_reason,
+            }
+        ],
+        "gateway.events_seen": result.events_seen,
+    }
+    if result.usage is not None:
+        response_body["usage"] = result.usage
+
+    await record_trace(
+        request_body=request_body,
+        response_body=response_body,
+        status_code=result.status_code,
+        latency_ms=latency_ms,
+        outcome=outcome,
+        error_message=result.error,
+        ttft_ms=result.ttft_ms,
+    )
+
+    # Cache population from streams (Phase 3). Streams skip the hot-path
+    # cache consult (a JSON hit can't answer an SSE request yet), so the
+    # embedding is computed HERE, in the cold path — get_embedding runs on
+    # the threadpool either way, and this task is already off the client's
+    # critical path. The reassembled text can then serve future
+    # NON-streaming duplicates of the same prompt.
+    if (
+        outcome == "ok"
+        and isinstance(request_body, dict)
+        and cache.is_cacheable_request(request_body)
+        and cache.is_storable_response(response_body)
+    ):
+        try:
+            from .embeddings import get_embedding
+            from .pii import mask_prompt
+
+            masked = mask_prompt(cache.serialize_messages(request_body))  # type: ignore[arg-type]
+            embedding = await get_embedding(masked)
+            # The cached copy must parse as a completion in the openai SDK,
+            # which requires id/created — the reassembled trace body has
+            # neither (streams carry them per-chunk).
+            cacheable_body = {
+                "id": f"chatcmpl-gwcache-{uuid.uuid4().hex[:24]}",
+                "created": int(time.time()),
+                **response_body,
+            }
+            await cache.store(
+                model_id=request_body["model"],
+                masked_prompt=masked,
+                embedding=embedding,
+                response_body=cacheable_body,
+            )
+        except Exception as exc:  # noqa: BLE001 — cache must never break the task
+            logger.error(
+                "STREAM CACHE POPULATION FAILED (skipped, client unaffected): %s: %s",
+                type(exc).__name__, exc,
+            )

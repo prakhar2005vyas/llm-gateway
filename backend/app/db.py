@@ -33,6 +33,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -106,9 +107,16 @@ async def session() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db() -> None:
-    """Create tables that don't exist yet. Idempotent; called on startup."""
+    """Ensure extensions + tables exist. Idempotent; called on startup.
+
+    Order matters: the vector extension must exist before create_all defines
+    the `vector(N)` column on semantic_cache. Postgres-only — SQLite (tests)
+    has no extensions and its variant column is plain JSON.
+    """
     engine = get_engine()
     async with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
     logger.info("database schema ensured")
 

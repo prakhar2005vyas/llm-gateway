@@ -14,12 +14,15 @@ async def test_health_ok():
     assert r.json()["status"] == "ok"
 
 
-async def test_stream_true_is_rejected_cleanly_in_phase0():
+async def test_malformed_json_body_is_rejected_cleanly():
+    # (The Phase 0/1 "stream=true → 400" rejection test lived here until
+    # Phase 2 implemented streaming for real — see test_streaming.py.)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gw") as ac:
         r = await ac.post(
             "/v1/chat/completions",
-            json={"model": "m", "messages": [], "stream": True},
+            content=b"{not json",
+            headers={"Content-Type": "application/json"},
         )
     assert r.status_code == 400
-    assert "streaming" in r.json()["error"]["message"].lower()
+    assert "valid JSON" in r.json()["error"]["message"]

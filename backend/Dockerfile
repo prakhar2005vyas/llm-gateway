@@ -7,6 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# CPU-only torch FIRST, from the CPU wheel index — sentence-transformers would
+# otherwise pull the CUDA build (~2GB of GPU libs that would never be used;
+# embeddings are CPU-by-decree, see CLAUDE.md hardware constraints).
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 # Install deps first for layer caching.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

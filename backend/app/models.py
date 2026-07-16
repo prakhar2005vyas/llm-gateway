@@ -1,4 +1,4 @@
-"""Relational schema — Trace + ModelPrice.
+"""Relational schema — Trace + ModelPrice + SemanticCache.
 
 ER decisions (deliberate, see also the module-level notes in db.py):
 
@@ -22,6 +22,13 @@ ER decisions (deliberate, see also the module-level notes in db.py):
 
 * Prices are Numeric, not Float — money in floats accumulates rounding error;
   cost figures are a headline resume number, so they must be exact.
+
+* SemanticCache.prompt_embedding is a pgvector `vector(N)` on Postgres and
+  degrades to JSON (list of floats) on SQLite so unit tests stay hermetic.
+  SQLite obviously can't do ANN similarity search — nearest-neighbor queries
+  are exercised against real Postgres; SQLite covers schema/round-trip only.
+  The dimension comes from settings (all-MiniLM = 384), resolved at class
+  definition time — changing it later means re-embedding the cache.
 """
 from __future__ import annotations
 
@@ -29,7 +36,9 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Index,
     Integer,
@@ -41,6 +50,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON
+
+from .config import get_settings
 
 
 def _utcnow() -> datetime:
@@ -87,6 +98,9 @@ class Trace(Base):
     model_id: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Streaming only: time-to-first-token, the Phase 2 headline metric.
+    # NULL for non-streamed requests.
+    ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -95,6 +109,10 @@ class Trace(Base):
     # USD. Numeric(12,8): six decimal places is not enough for per-request
     # costs at $0.0000004/token scale; 8 keeps sub-cent precision exact.
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 8), nullable=True)
+
+    # True when this request was served from the semantic cache: zero
+    # upstream calls, cost_usd is an honest 0 (actually free, not unknown).
+    cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Honest failure surface: 'ok' | 'upstream_error' | 'inconclusive' — a
     # trace that failed mid-flight is still a trace (never silently dropped).
@@ -136,3 +154,52 @@ class ModelPrice(Base):
             f"<ModelPrice {self.model_id} in={self.usd_per_1k_input}"
             f" out={self.usd_per_1k_output}>"
         )
+
+
+class SemanticCache(Base):
+    """One cached completion, addressable by prompt similarity (Phase 3).
+
+    THE PII INVARIANT (SPEC §6, cross-cutting rule): `masked_prompt` and
+    `prompt_embedding` are derived from the prompt AFTER `pii.mask_prompt()`
+    has run. Raw prompts must never be written here — otherwise the cache IS
+    a PII database and the masking feature is defeated before it exists.
+    Nothing in this table may bypass that path.
+
+    Cache key design: the embedding is the fuzzy key (similarity search);
+    `model_id` is an exact filter — an answer from gpt-4o-mini must never be
+    served for a gpt-4o request, however similar the prompts. The cached
+    `response_body` is the full OpenAI-shaped JSON so a hit can be returned
+    to the client indistinguishably from a real completion.
+    """
+
+    __tablename__ = "semantic_cache"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False, index=True
+    )
+
+    # Masked prompt text — kept for debugging/eviction and adversarial-miss
+    # analysis ("what did this vector actually say?").
+    masked_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    # vector(N) on Postgres; JSON float list on SQLite (round-trip only).
+    prompt_embedding: Mapped[list[float]] = mapped_column(
+        Vector(get_settings().embedding_dim).with_variant(JSON(), "sqlite"),
+        nullable=False,
+    )
+
+    # Exact-match constraint on hits: same model only.
+    model_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    # The complete OpenAI-shaped response a hit serves back.
+    response_body: Mapped[dict] = mapped_column(nullable=False)
+
+    # Ops facts for the cache-hit-rate story.
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_hit_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<SemanticCache {self.id} model={self.model_id} hits={self.hit_count}>"

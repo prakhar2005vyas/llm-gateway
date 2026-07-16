@@ -28,7 +28,10 @@ services:
       start_period: 5s
 
   postgres:
-    image: postgres:15-alpine
+    # pgvector build of Postgres 15 (Phase 3: semantic cache vectors). Same
+    # Postgres core as before, plus the `vector` extension available to
+    # CREATE EXTENSION at init.
+    image: pgvector/pgvector:pg15
     environment:
       POSTGRES_USER: gateway
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway_dev_pw}

@@ -46,6 +46,29 @@ class Settings(BaseSettings):
     db_pool_recycle_seconds: int = 300
     db_echo: bool = False
 
+    # --- Semantic cache (Phase 3) ---------------------------------------------
+    # Dimension of the embedding model's output. 384 = all-MiniLM-L6-v2 (the
+    # SPEC-chosen local CPU model). NOTE: changing this after rows exist
+    # requires dropping/re-embedding the cache — the column is dimensioned.
+    embedding_dim: int = 384
+    embedding_model_id: str = "all-MiniLM-L6-v2"
+    semantic_cache_enabled: bool = True
+    # Cosine similarity threshold for a hit. Tuned empirically (2026-07,
+    # all-MiniLM-L6-v2): paraphrases score ~0.92+, the adversarial pairs we
+    # must NOT collide ("delete my account"/"recover my account" 0.71,
+    # "cancel"/"renew subscription" 0.77) sit well below 0.90. Known
+    # limitation: entity/direction flips ("transfer TO"/"FROM savings", 0.99)
+    # are inseparable by MiniLM embeddings at ANY threshold — documented in
+    # the test suite, mitigated only by raising the threshold toward exact-
+    # match territory.
+    cache_similarity_threshold: float = 0.90
+    # Correctness rule (same argument as SPEC's coalescing temperature rule):
+    # a cached answer may only substitute a DETERMINISTIC request. Creative
+    # (high-temperature) calls expect variety; freezing one answer for them
+    # is a correctness bug. Requests without an explicit temperature default
+    # to 1.0 upstream → not cacheable.
+    cache_max_temperature: float = 0.2
+
     # --- Server --------------------------------------------------------------
     log_level: str = "INFO"
 

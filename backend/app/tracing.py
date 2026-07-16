@@ -162,6 +162,7 @@ async def record_stream_trace(
     request_body: dict | None,
     result: "StreamResult",
     latency_ms: int,
+    allow_cache_store: bool = True,
 ) -> None:
     """Trace one streamed request from its populated StreamResult.
 
@@ -214,8 +215,12 @@ async def record_stream_trace(
     # the threadpool either way, and this task is already off the client's
     # critical path. The reassembled text can then serve future
     # NON-streaming duplicates of the same prompt.
+    # allow_cache_store: the route passes False when the RAW request carried
+    # PII — request_body here is the MASKED copy (looks PII-free), so the
+    # is_cacheable_request guard alone can no longer see the hazard.
     if (
         outcome == "ok"
+        and allow_cache_store
         and isinstance(request_body, dict)
         and cache.is_cacheable_request(request_body)
         and cache.is_storable_response(response_body)

@@ -41,7 +41,7 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 from .config import get_settings
-from .pii import mask_prompt
+from .pii import contains_pii, mask_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,14 @@ def is_coalesceable(body: dict) -> bool:
         return False
     if not isinstance(body.get("model"), str):
         return False
-    return _serialize(body) is not None
+    serialized = _serialize(body)
+    if serialized is None:
+        return False
+    # PII collision guard (Phase 5): masked keys erase the difference between
+    # two users' distinct PII values — sharing one in-flight result across
+    # them would leak user A's answer to user B. PII-bearing requests are
+    # never coalesced.
+    return not contains_pii(serialized)
 
 
 def request_key(body: dict) -> str:

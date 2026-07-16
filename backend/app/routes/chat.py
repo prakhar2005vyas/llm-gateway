@@ -26,6 +26,7 @@ from starlette.background import BackgroundTask
 
 from .. import cache, coalesce, ratelimit
 from ..auth import require_gateway_key
+from ..pii import StreamUnmasker, mask_request, unmask_payload
 from ..tracing import record_stream_trace, record_trace
 from ..upstream import (
     StreamResult,
@@ -98,6 +99,13 @@ async def _non_streamed(body: dict) -> JSONResponse:
             ),
         )
 
+    # SPEC lifecycle step 3 (Phase 5): PII masking at the FORWARD BOUNDARY.
+    # Cache/coalesce guards above ran on the RAW body (PII-bearing requests
+    # are neither cached nor coalesced); from here on, only the MASKED body
+    # exists: it goes upstream, into coalescing suppliers, and into traces.
+    # The provider never sees raw PII; the map lives only in this request.
+    masked_body, pii_map = mask_request(body)
+
     # SPEC lifecycle step 5: exact-match coalescing. Concurrent identical
     # (deterministic) requests collapse into ONE upstream call — the leader
     # forwards, followers await its future and share the result. get_or_run's
@@ -108,11 +116,11 @@ async def _non_streamed(body: dict) -> JSONResponse:
         if coalesce.is_coalesceable(body):
             (status_code, payload), is_leader = await coalesce.coalescer.get_or_run(
                 coalesce.request_key(body),
-                lambda: forward_chat_completion(body),
+                lambda: forward_chat_completion(masked_body),
             )
             is_follower = not is_leader
         else:
-            status_code, payload = await forward_chat_completion(body)
+            status_code, payload = await forward_chat_completion(masked_body)
     except UpstreamError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.error("forward failed: %s", exc)
@@ -122,7 +130,7 @@ async def _non_streamed(body: dict) -> JSONResponse:
             "gateway_error",
             background=BackgroundTask(
                 record_trace,
-                request_body=body,
+                request_body=masked_body,  # traces hold MASKED text only
                 response_body=None,
                 status_code=502,
                 latency_ms=latency_ms,
@@ -132,13 +140,17 @@ async def _non_streamed(body: dict) -> JSONResponse:
         )
 
     latency_ms = int((time.perf_counter() - started) * 1000)
+    # The client gets the UNMASKED copy; the trace task below binds `payload`
+    # — the upstream's own placeholder-space dict, untouched — so the trace
+    # stays masked without any extra bookkeeping.
+    client_payload = unmask_payload(payload, pii_map)
     return JSONResponse(
         status_code=status_code,
-        content=payload,
+        content=client_payload,
         headers={"x-gateway-cache": "miss"} if decision.cacheable else None,
         background=BackgroundTask(
             record_trace,
-            request_body=body,
+            request_body=masked_body,
             response_body=payload,
             status_code=status_code,
             latency_ms=latency_ms,
@@ -157,7 +169,12 @@ async def _non_streamed(body: dict) -> JSONResponse:
 async def _streamed(body: dict):
     started = time.perf_counter()
     result = StreamResult()
-    upstream_gen = forward_stream(body, result)
+
+    # Phase 5: only the MASKED body leaves the gateway. StreamResult harvests
+    # the provider's placeholder-space bytes, so the stream trace is masked
+    # by construction; the client-facing relay below unmasks.
+    masked_body, pii_map = mask_request(body)
+    upstream_gen = forward_stream(masked_body, result)
 
     # Await the first chunk BEFORE building the response: this is both the
     # TTFT measurement point and the last moment the HTTP status can change.
@@ -176,7 +193,7 @@ async def _streamed(body: dict):
             "gateway_error",
             background=BackgroundTask(
                 record_stream_trace,
-                request_body=body,
+                request_body=masked_body,
                 result=result,
                 latency_ms=latency_ms,
             ),
@@ -186,10 +203,42 @@ async def _streamed(body: dict):
     status_code = result.status_code or 502
 
     async def relay() -> AsyncIterator[bytes]:
+        # No PII → verbatim byte relay (Phase 2 transparency, untouched).
+        # With PII → every outbound chunk passes through the StreamUnmasker:
+        # placeholders restored, partial-placeholder tails held back so the
+        # client never sees a fractured placeholder. If the unmasker hits
+        # genuinely invalid UTF-8, it degrades to verbatim passthrough for
+        # the remainder (placeholders left visible beats a killed stream —
+        # loud log either way).
+        unmasker = StreamUnmasker(pii_map) if pii_map else None
+
+        async def _out(chunk: bytes) -> bytes:
+            nonlocal unmasker
+            if unmasker is None:
+                return chunk
+            try:
+                return unmasker.feed(chunk)
+            except UnicodeDecodeError as exc:
+                logger.error(
+                    "stream unmasker hit invalid UTF-8 — degrading to "
+                    "verbatim relay (placeholders may reach the client): %s",
+                    exc,
+                )
+                unmasker = None
+                return chunk
+
         if first_chunk is not None:
-            yield first_chunk
+            if out := await _out(first_chunk):
+                yield out
         async for chunk in upstream_gen:
-            yield chunk
+            if out := await _out(chunk):
+                yield out
+        if unmasker is not None:
+            try:
+                if tail := unmasker.flush():
+                    yield tail
+            except UnicodeDecodeError as exc:
+                logger.error("stream unmasker flush failed (tail dropped): %s", exc)
 
     # Non-2xx: upstream rejected the request before streaming (auth, quota,
     # bad model...). forward_stream yielded its error body as plain bytes —
@@ -200,8 +249,11 @@ async def _streamed(body: dict):
         # BackgroundTask args bind at construction time, but total latency
         # only exists once the stream has drained — so it's computed HERE,
         # when Starlette runs the task after the response completes.
+        # allow_cache_store: masked bodies look PII-free, so the population
+        # guard downstream can't see the collision hazard — the route can.
         await record_stream_trace(
-            request_body=body,
+            allow_cache_store=not pii_map,
+            request_body=masked_body,
             result=result,
             latency_ms=int((time.perf_counter() - started) * 1000),
         )

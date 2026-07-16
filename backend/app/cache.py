@@ -45,7 +45,7 @@ from .config import get_settings
 from .db import get_engine, session
 from .embeddings import get_embedding
 from .models import SemanticCache
-from .pii import mask_prompt
+from .pii import contains_pii, mask_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,14 @@ def is_cacheable_request(body: dict) -> bool:
         return False
     if not isinstance(body.get("model"), str):
         return False
-    return serialize_messages(body) is not None
+    serialized = serialize_messages(body)
+    if serialized is None:
+        return False
+    # PII collision guard (Phase 5): different users' prompts can mask to the
+    # IDENTICAL text ("my email is <EMAIL_1>") — caching one user's answer
+    # under that key would serve it to the other. PII-bearing requests bypass
+    # the cache entirely.
+    return not contains_pii(serialized)
 
 
 async def consult(body: dict) -> CacheDecision:

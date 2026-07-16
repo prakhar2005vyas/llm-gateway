@@ -62,13 +62,13 @@ async def test_round_trip_embedding_and_response():
     assert row.last_hit_at is None
 
 
-def test_mask_prompt_is_identity_until_phase5():
-    # Pins the CURRENT placeholder contract loudly. When Phase 5 implements
-    # real redaction, this test MUST be replaced by real redaction tests —
-    # if it starts failing because masking now works, that's the reminder.
-    assert mask_prompt("alice@example.com called 555-0100") == (
-        "alice@example.com called 555-0100"
-    )
+def test_mask_prompt_redacts_for_the_cache_pipeline():
+    # Phase 5 landed: the identity-stub pin test this replaces did its job
+    # (it failed the moment real masking arrived). The cache pipeline's view:
+    # masked text only, no raw PII, map not needed for keying.
+    masked = mask_prompt("mail alice@example.com about invoice 42")
+    assert "alice@example.com" not in masked
+    assert "<EMAIL_1>" in masked
     assert mask_prompt("") == ""
 
 

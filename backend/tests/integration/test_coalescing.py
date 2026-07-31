@@ -10,6 +10,7 @@ import pytest
 import respx
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.db import dispose_db, init_db, session
 from app.main import app
 from app.models import Trace
@@ -41,7 +42,14 @@ async def _db():
 
 
 @respx.mock
-async def test_concurrent_identical_requests_fire_one_upstream_call():
+async def test_concurrent_identical_requests_fire_one_upstream_call(monkeypatch):
+    # Isolate coalescing (same guard as the chaos suite): with the cache in
+    # the path, each request's consult() embeds on the CPU threadpool first,
+    # staggering arrivals — under full-suite load the stagger can exceed the
+    # stub's flight window and a straggler starts a second flight (flaky).
+    monkeypatch.setenv("SEMANTIC_CACHE_ENABLED", "false")
+    get_settings.cache_clear()
+
     async def slow_upstream(_request):
         await asyncio.sleep(0.15)  # hold the flight open so all callers pile up
         return httpx.Response(200, json=COMPLETION)

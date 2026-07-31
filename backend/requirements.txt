@@ -20,3 +20,6 @@ pgvector>=0.2.5,<0.4
 # so the image never ships CUDA libraries (~2GB saved, and no GPU assumptions —
 # CLAUDE.md: must run on a GPU-less machine).
 sentence-transformers>=3.0,<4
+
+# Phase 7 — Prometheus metrics (/metrics endpoint scraped by Prometheus/Grafana)
+prometheus-client>=0.20,<1

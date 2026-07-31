@@ -26,6 +26,7 @@ from starlette.background import BackgroundTask
 
 from .. import cache, coalesce, ratelimit
 from ..auth import require_gateway_key
+from ..metrics import TTFT_LATENCY, normalize_model_name
 from ..pii import StreamUnmasker, mask_request, unmask_payload
 from ..tracing import record_stream_trace, record_trace
 from ..upstream import (
@@ -207,6 +208,16 @@ async def _streamed(body: dict):
 
     result.ttft_ms = int((time.perf_counter() - started) * 1000)
     status_code = result.status_code or 502
+    # Phase 7: TTFT histogram — the streaming headline metric, observed at
+    # the same instant it's measured. Model label from the CLIENT's request
+    # (normalized: unknown ids collapse to one bounded label value).
+    try:
+        TTFT_LATENCY.labels(
+            model=normalize_model_name(body.get("model"))
+        ).observe(result.ttft_ms / 1000.0)
+    except Exception as exc:  # noqa: BLE001 — metrics must never hurt the relay
+        logger.error("TTFT metric update failed (non-fatal): %s: %s",
+                     type(exc).__name__, exc)
 
     async def relay() -> AsyncIterator[bytes]:
         # No PII → verbatim byte relay (Phase 2 transparency, untouched).

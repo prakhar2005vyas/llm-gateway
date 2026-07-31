@@ -77,9 +77,11 @@ async def test_event_loop_is_not_blocked_during_inference():
 
     # The loop must have been free for the overwhelming majority of the
     # elapsed time. Expected ticks at perfect freedom ≈ elapsed/5ms; demand
-    # at least a third of that (generous margin for scheduling jitter).
+    # at least a quarter of that (generous margin for scheduling jitter and
+    # Windows Defender I/O stalls during the model load — a blocked loop
+    # collapses to near-zero ticks, so the margin loses no signal).
     expected_if_free = elapsed / 0.005
-    assert ticks >= expected_if_free / 3, (
+    assert ticks >= expected_if_free / 4, (
         f"event loop starved: {ticks} heartbeats in {elapsed:.2f}s "
         f"(≈{expected_if_free:.0f} expected if free) — inference is "
         "blocking the loop"

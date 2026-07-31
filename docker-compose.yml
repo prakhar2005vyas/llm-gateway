@@ -1,4 +1,6 @@
-# Phase 1 — gateway + Postgres. Redis/Grafana/etc. join in their own phases.
+# Gateway + Postgres (Phase 1) + Prometheus/Grafana (Phase 7). All services
+# share the default compose network — Prometheus scrapes `gateway:8000` by
+# service name.
 #
 # The gateway waits for Postgres via `condition: service_healthy`, but it also
 # boots fine if the DB later dies (degraded: proxying continues, traces drop
@@ -53,5 +55,37 @@ services:
     # ports:
     #   - "5432:5432"
 
+  # --- Phase 7: observability -------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - gateway
+    restart: unless-stopped
+    # Same 16GB-target frugality as postgres above: demo-scale scrape volume
+    # needs nothing like Prometheus's default appetite.
+    mem_limit: 256m
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      # Dashboards/datasources built in the UI survive a compose restart.
+      - grafana-data:/var/lib/grafana
+      # Provisioned config (Phase 7): Prometheus datasource + the LLM Gateway
+      # dashboard load automatically — zero clicks after `docker compose up`.
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    mem_limit: 256m
+
 volumes:
   pgdata:
+  grafana-data:

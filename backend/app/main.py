@@ -8,7 +8,8 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .config import get_settings
 from .db import dispose_db, init_db
@@ -45,6 +46,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LLM Gateway", version="0.2.0", lifespan=lifespan)
 app.include_router(chat.router)
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    # Phase 7: Prometheus scrape target. A plain route (not an ASGI mount) so
+    # the bare path serves directly — no 307 to /metrics/. No auth, no rate
+    # limit, no proxy lifecycle; it renders process-local counters only.
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")

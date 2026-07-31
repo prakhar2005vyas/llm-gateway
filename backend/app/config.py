@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     # Recycle idle connections (Neon and other serverless PG close idle conns).
     db_pool_recycle_seconds: int = 300
     db_echo: bool = False
+    # Hard ceiling on one cold-path trace write (Phase 7 frozen-DB fix). A
+    # BackgroundTask runs inside the ASGI cycle: a write wedged on a frozen
+    # DB holds that keep-alive connection hostage and the NEXT request queued
+    # on it stalls behind the freeze. At the timeout the write is cancelled
+    # and shed loudly — bounded cold path, per SPEC's backpressure rule.
+    trace_write_timeout_seconds: float = 5.0
 
     # --- Semantic cache (Phase 3) ---------------------------------------------
     # Dimension of the embedding model's output. 384 = all-MiniLM-L6-v2 (the

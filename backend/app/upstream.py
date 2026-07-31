@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from .config import get_settings
+from .metrics import FAILOVER_COUNT, normalize_model_name
 from .sse import ByteStreamProcessor
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,17 @@ class UpstreamError(Exception):
 def _backoff_seconds(attempt: int) -> float:
     """Exponential backoff: 0.5s, 1s, 2s, ... capped at 8s."""
     return min(0.5 * (2**attempt), 8.0)
+
+
+def _count_failover(body: dict) -> None:
+    """Phase 7: bump the retry/failover counter. Called exactly where a
+    retry is scheduled or a provider failover is logged. Never raises —
+    metrics must never affect forwarding."""
+    try:
+        FAILOVER_COUNT.labels(model=normalize_model_name(body.get("model"))).inc()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("failover metric update failed (non-fatal): %s: %s",
+                     type(exc).__name__, exc)
 
 
 @dataclass(frozen=True)
@@ -104,6 +116,7 @@ async def forward_chat_completion(body: dict) -> tuple[int, dict]:
                     "provider %r unreachable after all retries — FAILING OVER: %s",
                     provider.name, exc,
                 )
+                _count_failover(body)
             continue
         if status >= 500 and not is_last:
             last_5xx = (status, payload)
@@ -111,6 +124,7 @@ async def forward_chat_completion(body: dict) -> tuple[int, dict]:
                 "provider %r still %d after all retries — FAILING OVER",
                 provider.name, status,
             )
+            _count_failover(body)
             continue
         if provider.name != "primary":
             logger.warning("request served by %r provider", provider.name)
@@ -152,6 +166,7 @@ async def _forward_via(provider: Provider, body: dict) -> tuple[int, dict]:
                     return resp.status_code, _safe_json(resp)
 
             if attempt < max_tries - 1:
+                _count_failover(body)  # a retry is now committed to
                 await asyncio.sleep(_backoff_seconds(attempt))
 
     raise UpstreamError(
@@ -303,6 +318,7 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
                                 "stream: provider %r still %d after all retries "
                                 "— FAILING OVER", provider.name, resp.status_code,
                             )
+                            _count_failover(body)
                             failed_over = True
                             break
                         elif resp.status_code >= 400:
@@ -333,6 +349,7 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
                         provider.name, attempt + 1, max_tries, exc,
                     )
                 if attempt < max_tries - 1:
+                    _count_failover(body)  # a retry is now committed to
                     await asyncio.sleep(_backoff_seconds(attempt))
 
         if not is_last and not failed_over:
@@ -340,6 +357,7 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
                 "stream: provider %r unreachable after all retries — FAILING OVER: %s",
                 provider.name, last_exc,
             )
+            _count_failover(body)
 
     raise UpstreamError(
         f"all {len(chain)} provider(s) unreachable for stream: {last_exc}"

@@ -15,6 +15,7 @@ Failure contract (non-negotiable):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -22,8 +23,10 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from . import cache, evals
+from .config import get_settings
 from .costs import cost_for_model
 from .db import session
+from .metrics import REQUEST_COUNT, REQUEST_LATENCY, normalize_model_name
 from .models import ModelPrice, Trace
 
 
@@ -90,54 +93,85 @@ async def record_trace(
     """
     trace_id = uuid.uuid4()
     is_cache_hit = cache_decision is not None and cache_decision.hit is not None
-    try:
-        # The client asked for this model id, and the price table is keyed by
-        # what clients ask for ("gpt-4o-mini"), not the resolved snapshot id
-        # the provider reports back ("gpt-4o-mini-2024-07-18"). Fall back to
-        # the response's id only when the request had none.
-        model_id: str | None = None
-        if isinstance(request_body, dict):
-            model_id = request_body.get("model") or None
-        if model_id is None and isinstance(response_body, dict):
-            model_id = response_body.get("model") or None
 
+    # The client asked for this model id, and the price table is keyed by
+    # what clients ask for ("gpt-4o-mini"), not the resolved snapshot id
+    # the provider reports back ("gpt-4o-mini-2024-07-18"). Fall back to
+    # the response's id only when the request had none.
+    model_id: str | None = None
+    if isinstance(request_body, dict):
+        model_id = request_body.get("model") or None
+    if model_id is None and isinstance(response_body, dict):
+        model_id = response_body.get("model") or None
+
+    # Phase 7: Prometheus counters — process-local, so they update even when
+    # the DB write below fails (metrics and traces degrade independently).
+    # Own never-raise boundary, same contract as everything in this module.
+    try:
+        model_label = normalize_model_name(model_id)
+        status_label = str(status_code) if status_code is not None else "none"
+        REQUEST_COUNT.labels(
+            model=model_label,
+            status_code=status_label,
+            cache_hit=str(is_cache_hit).lower(),
+        ).inc()
+        if latency_ms is not None:
+            REQUEST_LATENCY.labels(
+                model=model_label, status_code=status_label
+            ).observe(latency_ms / 1000.0)
+    except Exception as exc:  # noqa: BLE001 — metrics must never hurt tracing
+        logger.error("metrics update failed (non-fatal): %s: %s",
+                     type(exc).__name__, exc)
+
+    try:
         prompt_tokens, completion_tokens, total_tokens = _extract_usage(response_body)
 
-        async with session() as s:
-            if is_cache_hit or coalesced:
-                # No upstream call happened FOR THIS REQUEST (cache hit, or
-                # coalesced follower sharing the leader's call): cost is a
-                # LITERAL zero (honest "free", distinct from NULL "unknown"),
-                # tokens stay NULL — the leader's trace carries the real
-                # spend exactly once.
-                cost = Decimal("0")
-                prompt_tokens = completion_tokens = total_tokens = None
-            else:
-                price_row = None
-                if model_id is not None:
-                    price_row = await s.get(ModelPrice, model_id)
-                prices = {price_row.model_id: price_row} if price_row else {}
-                cost = cost_for_model(model_id, prompt_tokens, completion_tokens, prices)
+        async def _write() -> None:
+            nonlocal prompt_tokens, completion_tokens, total_tokens
+            async with session() as s:
+                if is_cache_hit or coalesced:
+                    # No upstream call happened FOR THIS REQUEST (cache hit,
+                    # or coalesced follower sharing the leader's call): cost
+                    # is a LITERAL zero (honest "free", distinct from NULL
+                    # "unknown"), tokens stay NULL — the leader's trace
+                    # carries the real spend exactly once.
+                    cost = Decimal("0")
+                    prompt_tokens = completion_tokens = total_tokens = None
+                else:
+                    price_row = None
+                    if model_id is not None:
+                        price_row = await s.get(ModelPrice, model_id)
+                    prices = {price_row.model_id: price_row} if price_row else {}
+                    cost = cost_for_model(model_id, prompt_tokens, completion_tokens, prices)
 
-            s.add(
-                Trace(
-                    id=trace_id,
-                    request_body=request_body,
-                    response_body=response_body,
-                    model_id=model_id,
-                    status_code=status_code,
-                    latency_ms=latency_ms,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens,
-                    cost_usd=cost,
-                    cache_hit=is_cache_hit,
-                    coalesced=coalesced,
-                    outcome=outcome,
-                    error_message=error_message,
-                    ttft_ms=ttft_ms,
+                s.add(
+                    Trace(
+                        id=trace_id,
+                        request_body=request_body,
+                        response_body=response_body,
+                        model_id=model_id,
+                        status_code=status_code,
+                        latency_ms=latency_ms,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        cost_usd=cost,
+                        cache_hit=is_cache_hit,
+                        coalesced=coalesced,
+                        outcome=outcome,
+                        error_message=error_message,
+                        ttft_ms=ttft_ms,
+                    )
                 )
-            )
+
+        # Strict ceiling on the write (frozen-DB fix): this BackgroundTask
+        # runs inside the ASGI cycle, so a write wedged on a frozen DB would
+        # hold the keep-alive connection hostage — the NEXT request pipelined
+        # on it would stall behind the freeze. At the timeout the write is
+        # cancelled (session rolls back) and shed via the except-arm below.
+        await asyncio.wait_for(
+            _write(), timeout=get_settings().trace_write_timeout_seconds
+        )
         logger.debug("trace %s recorded (model=%s outcome=%s)", trace_id, model_id, outcome)
 
         # Phase 6: sampled LLM-as-judge eval — LAST cold-path stage, strictly
@@ -165,25 +199,39 @@ async def record_trace(
         )
 
     # Cache bookkeeping AFTER the trace attempt, isolated from it — each of
-    # these owns its own never-raise boundary.
+    # these owns its own never-raise boundary, plus the same write-timeout
+    # ceiling as the trace itself (these too run inside the ASGI cycle and
+    # would hold the connection hostage on a frozen DB).
     if cache_decision is None:
         return
-    if is_cache_hit:
-        await cache.record_hit(cache_decision.hit.id)
-    elif (
-        outcome == "ok"
-        and not coalesced  # the leader stores once; followers would only re-upsert
-        and cache_decision.cacheable
-        and cache_decision.masked_prompt is not None
-        and cache_decision.embedding is not None
-        and isinstance(request_body, dict)
-        and cache.is_storable_response(response_body)
-    ):
-        await cache.store(
-            model_id=request_body["model"],
-            masked_prompt=cache_decision.masked_prompt,
-            embedding=cache_decision.embedding,
-            response_body=response_body,  # type: ignore[arg-type]
+    try:
+        timeout = get_settings().trace_write_timeout_seconds
+        if is_cache_hit:
+            await asyncio.wait_for(
+                cache.record_hit(cache_decision.hit.id), timeout=timeout
+            )
+        elif (
+            outcome == "ok"
+            and not coalesced  # the leader stores once; followers would only re-upsert
+            and cache_decision.cacheable
+            and cache_decision.masked_prompt is not None
+            and cache_decision.embedding is not None
+            and isinstance(request_body, dict)
+            and cache.is_storable_response(response_body)
+        ):
+            await asyncio.wait_for(
+                cache.store(
+                    model_id=request_body["model"],
+                    masked_prompt=cache_decision.masked_prompt,
+                    embedding=cache_decision.embedding,
+                    response_body=response_body,  # type: ignore[arg-type]
+                ),
+                timeout=timeout,
+            )
+    except Exception as exc:  # noqa: BLE001 — mostly TimeoutError: shed loudly
+        logger.error(
+            "CACHE BOOKKEEPING TIMED OUT/FAILED (skipped, client unaffected): %s: %s",
+            type(exc).__name__, exc,
         )
 
 

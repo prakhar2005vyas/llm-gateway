@@ -1,0 +1,11 @@
+# Grafana datasource provisioning (Phase 7). Loaded once at container start:
+# the bundled Prometheus becomes the default datasource, no clicking required.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

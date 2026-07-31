@@ -19,6 +19,12 @@ def _reset_settings_cache(monkeypatch):
     # Hermetic DB default: no test may ever require (or accidentally reach)
     # a real Postgres. Tests that need rows override/reset via app.db helpers.
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+    # The cold-path write ceiling is a prod-Postgres number (5s). Test DBs
+    # are deliberately slow (:memory: SQLite serializes every write through
+    # ONE shared connection, on a loaded CI/dev box) — legit writes must not
+    # shed mid-test. The frozen-DB chaos test overrides this to exercise the
+    # shed on purpose.
+    monkeypatch.setenv("TRACE_WRITE_TIMEOUT_SECONDS", "120")
     get_settings.cache_clear()
     # The rate limiter is a process-wide singleton; without a reset, requests
     # accumulate across tests inside one monotonic window and unrelated tests

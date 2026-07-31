@@ -1,0 +1,11 @@
+# Prometheus scrape config (Phase 7). Mounted read-only into the prometheus
+# container by docker-compose. NOTE: the gateway's compose service name is
+# `gateway` (not `backend`) — targets resolve on the compose network.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8000"]

@@ -13,7 +13,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .config import get_settings
 from .db import dispose_db, init_db
-from .routes import chat
+from .routes import chat, internal
 from .seed import seed_model_prices
 
 settings = get_settings()
@@ -46,6 +46,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LLM Gateway", version="0.2.0", lifespan=lifespan)
 app.include_router(chat.router)
+# Phase 7 UI: read-only trace browser API, deliberately outside /v1.
+app.include_router(internal.router, prefix="/internal", tags=["Internal"])
 
 
 @app.get("/metrics", include_in_schema=False)

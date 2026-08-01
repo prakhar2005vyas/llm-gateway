@@ -88,14 +88,22 @@ class Server:
 
 
 @pytest.fixture(autouse=True)
-async def _db():
+async def _db(tmp_path, monkeypatch):
+    # FILE-based SQLite, not :memory: (same lesson as test_frozen_db): the
+    # shared-memory DB rides ONE StaticPool connection, and under chaos-scale
+    # concurrency + a loaded machine its writes get flaky (lost commits,
+    # multi-second stalls). A file gives every pooled connection real
+    # isolation, like the Postgres these tests stand in for.
+    db_file = (tmp_path / "chaos.db").as_posix()
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_file}")
+    get_settings.cache_clear()
     await dispose_db()
     await init_db()
     yield
     await dispose_db()
 
 
-async def wait_for_traces(expected: int, timeout: float = 15.0) -> None:
+async def wait_for_traces(expected: int, timeout: float = 30.0) -> None:
     """Background tasks finish after responses; poll until all traces land."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

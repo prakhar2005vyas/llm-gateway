@@ -1,0 +1,13 @@
+# Demo overlay: run the stack against the local stub upstream (no API key,
+# no cost). Usage:
+#   python scripts/demo_stub_upstream.py &
+#   docker compose -f docker-compose.yml -f compose.demo.yml up --build
+# Not auto-loaded (that would hijack real runs) — must be passed with -f.
+services:
+  gateway:
+    environment:
+      UPSTREAM_BASE_URL: http://host.docker.internal:9099/v1
+      UPSTREAM_API_KEY: demo-stub-key
+      RATE_LIMIT_REQUESTS: "100000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

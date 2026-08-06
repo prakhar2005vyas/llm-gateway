@@ -21,22 +21,24 @@ async def _fresh_db():
 
 async def test_seed_inserts_all_baselines_on_empty_db():
     inserted = await seed_model_prices()
-    assert inserted == len(BASELINE_PRICES) == 3
+    assert inserted == len(BASELINE_PRICES)
 
     async with session() as s:
         rows = {p.model_id: p for p in (await s.execute(select(ModelPrice))).scalars()}
-    assert set(rows) == {"gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"}
-    # Spot-check one hand-copied rate pair.
+    assert set(rows) == set(BASELINE_PRICES)
+    # Spot-check hand-copied rate pairs, one paid + one free-tier.
     assert rows["gpt-4o"].usd_per_1k_input == Decimal("0.0025")
     assert rows["gpt-4o"].usd_per_1k_output == Decimal("0.01")
+    assert rows["llama-3.1-8b-instant"].usd_per_1k_input == Decimal("0.00005")
+    assert rows["llama3"].usd_per_1k_output == Decimal("0")
 
 
 async def test_seed_is_idempotent():
-    assert await seed_model_prices() == 3
+    assert await seed_model_prices() == len(BASELINE_PRICES)
     assert await seed_model_prices() == 0  # second run: nothing to do
     async with session() as s:
         count = len((await s.execute(select(ModelPrice))).scalars().all())
-    assert count == 3
+    assert count == len(BASELINE_PRICES)
 
 
 async def test_seed_never_overwrites_operator_edits():
@@ -53,7 +55,7 @@ async def test_seed_never_overwrites_operator_edits():
 
     # ...then the container restarts and reseeds.
     inserted = await seed_model_prices()
-    assert inserted == 2  # only the two missing baselines
+    assert inserted == len(BASELINE_PRICES) - 1  # only the missing baselines
 
     async with session() as s:
         row = await s.get(ModelPrice, "gpt-4o-mini")

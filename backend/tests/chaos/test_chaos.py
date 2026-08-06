@@ -89,16 +89,25 @@ class Server:
 
 @pytest.fixture(autouse=True)
 async def _db(tmp_path, monkeypatch):
-    # FILE-based SQLite, not :memory: (same lesson as test_frozen_db): the
-    # shared-memory DB rides ONE StaticPool connection, and under chaos-scale
-    # concurrency + a loaded machine its writes get flaky (lost commits,
-    # multi-second stalls). A file gives every pooled connection real
-    # isolation, like the Postgres these tests stand in for.
+    # FILE-based SQLite with WAL mode + generous busy_timeout.
+    # The 500-request coalescing test generates 499 follower trace writes that
+    # all land concurrently; SQLite's default journal mode fails immediately
+    # with SQLITE_BUSY when the write lock is held. Two pragmas fix it:
+    # * journal_mode=WAL: readers never block writers; writers serialize
+    #   without forcing readers to retry — lock contention drops sharply.
+    # * busy_timeout=60000: when a writer does wait for another, SQLite
+    #   spins for up to 60s before returning SQLITE_BUSY, so the few writes
+    #   that truly overlap serialize gracefully instead of failing.
     db_file = (tmp_path / "chaos.db").as_posix()
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_file}")
     get_settings.cache_clear()
     await dispose_db()
     await init_db()
+    from sqlalchemy import text
+    from app.db import get_engine
+    async with get_engine().begin() as conn:
+        await conn.execute(text("PRAGMA journal_mode=WAL"))
+        await conn.execute(text("PRAGMA busy_timeout=60000"))
     yield
     await dispose_db()
 

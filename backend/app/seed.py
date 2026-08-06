@@ -24,13 +24,28 @@ logger = logging.getLogger(__name__)
 #   gpt-4o-mini:   $0.15/1M in,  $0.60/1M out
 #   gpt-4o:        $2.50/1M in, $10.00/1M out
 #   gpt-3.5-turbo: $0.50/1M in,  $1.50/1M out
+# Free-tier providers (all OpenAI-compatible — see .env.example recipes).
+# Groq/Gemini free tiers BILL $0, but traces record the provider's list
+# price so the "what would this traffic cost" story stays visible; Ollama
+# runs locally and is genuinely $0. Rates hand-copied 2026-08 — verify
+# against the pricing pages before quoting cost aggregates.
+#   llama-3.1-8b-instant (Groq):    $0.05/1M in, $0.08/1M out
+#   llama-3.3-70b-versatile (Groq): $0.59/1M in, $0.79/1M out
+#   gemini-1.5-flash:               $0.075/1M in, $0.30/1M out
+#   gemini-2.0-flash:               $0.10/1M in, $0.40/1M out
+#   llama3 (Ollama, local):         $0
 BASELINE_PRICES: dict[str, tuple[Decimal, Decimal]] = {
     "gpt-4o-mini": (Decimal("0.00015"), Decimal("0.0006")),
     "gpt-4o": (Decimal("0.0025"), Decimal("0.01")),
     "gpt-3.5-turbo": (Decimal("0.0005"), Decimal("0.0015")),
+    "llama-3.1-8b-instant": (Decimal("0.00005"), Decimal("0.00008")),
+    "llama-3.3-70b-versatile": (Decimal("0.00059"), Decimal("0.00079")),
+    "gemini-1.5-flash": (Decimal("0.000075"), Decimal("0.0003")),
+    "gemini-2.0-flash": (Decimal("0.0001"), Decimal("0.0004")),
+    "llama3": (Decimal("0"), Decimal("0")),
 }
 
-_SEED_SOURCE = "baseline seed (openai pricing page, 2026-07)"
+_SEED_SOURCE = "baseline seed (provider pricing pages, 2026-08)"
 
 
 async def seed_model_prices() -> int:

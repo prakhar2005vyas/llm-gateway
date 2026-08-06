@@ -116,7 +116,8 @@ async def main() -> int:
     ap.add_argument("--concurrency", type=int, default=50)
     ap.add_argument("--hot-ratio", type=float, default=0.5,
                     help="fraction of requests using the identical hot prompt")
-    ap.add_argument("--model", default="gpt-4o-mini")
+    ap.add_argument("--model", default="llama-3.1-8b-instant",
+                    help="forwarded verbatim — must exist at the configured upstream")
     ap.add_argument("--api-key", default="", help="gateway bearer token if auth is on")
     args = ap.parse_args()
 

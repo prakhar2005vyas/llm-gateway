@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
@@ -33,6 +34,47 @@ logger = logging.getLogger(__name__)
 
 # Transport-level faults worth retrying (DNS, connect, read timeout, ...).
 _RETRYABLE_EXC = (httpx.TransportError,)
+
+# Fireworks-style model paths: accounts/<org>/models/<name>
+_FIREWORKS_MODEL_RE = re.compile(r"^accounts/[^/]+/models/(.+)$")
+
+
+def _rewrite_model(body: dict) -> dict:
+    """Return a copy of body with the model field normalised for the upstream.
+
+    Two cases:
+    * UPSTREAM_MODEL_ID is set → always use that value (explicit override;
+      handles provider migrations without client changes).
+    * UPSTREAM_MODEL_ID is empty → passthrough UNLESS the model looks like a
+      Fireworks path (accounts/<org>/models/<name>), in which case we strip
+      to the bare model name and warn — a Fireworks path is guaranteed wrong
+      on any other provider.
+    """
+    settings = get_settings()
+    incoming = body.get("model")
+
+    if settings.upstream_model_id:
+        if incoming != settings.upstream_model_id:
+            logger.info(
+                "model rewrite: %r → %r (UPSTREAM_MODEL_ID override)",
+                incoming,
+                settings.upstream_model_id,
+            )
+        return {**body, "model": settings.upstream_model_id}
+
+    if isinstance(incoming, str):
+        m = _FIREWORKS_MODEL_RE.match(incoming)
+        if m:
+            bare = m.group(1)
+            logger.warning(
+                "model rewrite: Fireworks path %r stripped to %r "
+                "(set UPSTREAM_MODEL_ID to suppress this warning)",
+                incoming,
+                bare,
+            )
+            return {**body, "model": bare}
+
+    return body
 
 
 class UpstreamError(Exception):
@@ -103,6 +145,7 @@ async def forward_chat_completion(body: dict) -> tuple[int, dict]:
     """
     last_exc: Exception | None = None
     last_5xx: tuple[int, dict] | None = None
+    body = _rewrite_model(body)
     chain = providers()
 
     for provider in chain:
@@ -292,6 +335,7 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
     settings = get_settings()
     max_tries = settings.upstream_max_retries + 1
     last_exc: Exception | None = None
+    body = _rewrite_model(body)
     chain = providers()
 
     for provider in chain:

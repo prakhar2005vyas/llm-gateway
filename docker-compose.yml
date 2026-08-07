@@ -18,10 +18,17 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://gateway:${POSTGRES_PASSWORD:-gateway_dev_pw}@postgres:5432/gateway
+      # Pinned explicitly so the rewrite fires even when .env is absent.
+      # env_file supplies the same value; the environment block wins on conflict.
+      UPSTREAM_MODEL_ID: ${UPSTREAM_MODEL_ID:-llama-3.3-70b-versatile}
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    # Hard ceiling matches the 16GB-constrained target machine (CLAUDE.md).
+    # Under OOM Docker kills this container cleanly before the OS OOM-killer
+    # fires and takes down unrelated processes (Postgres, IDE, etc.).
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
       interval: 10s
@@ -59,7 +66,7 @@ services:
   prometheus:
     image: prom/prometheus:latest
     ports:
-      - "9090:9090"
+      - "9091:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     depends_on:
@@ -72,7 +79,7 @@ services:
   grafana:
     image: grafana/grafana:latest
     ports:
-      - "3000:3000"
+      - "3001:3000"
     volumes:
       # Dashboards/datasources built in the UI survive a compose restart.
       - grafana-data:/var/lib/grafana

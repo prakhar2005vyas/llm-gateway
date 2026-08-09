@@ -13,14 +13,43 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .config import get_settings
 from .db import dispose_db, init_db
+from .embeddings import warmup
+from .middleware import RequestTracingMiddleware
+from .request_context import RequestContextFilter
 from .routes import chat, internal
 from .seed import seed_model_prices
 
 settings = get_settings()
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+
+_LOG_FORMAT = (
+    "%(asctime)s %(levelname)s %(name)s "
+    "[Test: %(test_name)s] [Req: %(request_id)s] %(message)s"
 )
+
+# Python's logging propagation model: a filter added to a Logger is only
+# consulted for records *originated* on that logger — propagated records from
+# child loggers (app.cache, app.embeddings, …) skip the parent logger's filter
+# list and go straight to the parent's *handlers*.  The filter must therefore
+# live on each Handler, not on the Logger itself.
+#
+# Execution order: uvicorn installs its own StreamHandler on the root logger
+# BEFORE it imports the ASGI app (main.py), so basicConfig() would be a no-op
+# here.  We instead update every existing handler in-place and fall back to
+# basicConfig only when no handlers are present yet (unit-test bare-Python
+# import, or first-time process start before any logging has been configured).
+_root_logger = logging.getLogger()
+_root_logger.setLevel(getattr(logging, settings.log_level.upper(), logging.INFO))
+if not _root_logger.handlers:
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format=_LOG_FORMAT,
+    )
+_context_filter = RequestContextFilter()
+_formatter = logging.Formatter(_LOG_FORMAT)
+for _handler in _root_logger.handlers:
+    _handler.setFormatter(_formatter)
+    _handler.addFilter(_context_filter)  # filter on the handler, not the logger
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,11 +69,24 @@ async def lifespan(app: FastAPI):
             type(exc).__name__,
             exc,
         )
+    try:
+        await warmup()
+    except Exception as exc:  # noqa: BLE001 — a missing model degrades to lazy load
+        logger.error(
+            "EMBEDDING MODEL WARMUP FAILED — first cacheable request will pay "
+            "the load cost: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
     yield
     await dispose_db()
 
 
 app = FastAPI(title="LLM Gateway", version="0.2.0", lifespan=lifespan)
+# Raw ASGI middleware: stamps every request with X-Request-ID / X-Test-Name
+# context vars and echoes both back in response headers.  Must be added after
+# the app is constructed so it wraps the complete router/middleware stack.
+app.add_middleware(RequestTracingMiddleware)
 app.include_router(chat.router)
 # Phase 7 UI: read-only trace browser API, deliberately outside /v1.
 app.include_router(internal.router, prefix="/internal", tags=["Internal"])

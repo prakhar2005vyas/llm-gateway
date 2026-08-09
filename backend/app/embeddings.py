@@ -54,6 +54,8 @@ def _load_model_sync() -> "SentenceTransformer":
         settings.embedding_model_id,
     )
     model = SentenceTransformer(settings.embedding_model_id, device="cpu")
+    import torch  # sentence_transformers always installs torch; deferred like ST above
+    torch.set_num_threads(1)  # one thread per encode call — prevents oversubscription
     dim = model.get_sentence_embedding_dimension()
     if dim != settings.embedding_dim:
         # Fail LOUDLY at load, not at insert: a mismatched vector would be

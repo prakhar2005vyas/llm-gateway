@@ -112,12 +112,46 @@ async def init_db() -> None:
     Order matters: the vector extension must exist before create_all defines
     the `vector(N)` column on semantic_cache. Postgres-only — SQLite (tests)
     has no extensions and its variant column is plain JSON.
+
+    Additive column migrations: create_all() creates missing tables but never
+    adds columns to existing ones. Any column added to the ORM models after the
+    table was first created must also be listed here as an explicit
+    ADD COLUMN IF NOT EXISTS so that a live database picks it up on next
+    startup without a full re-initialisation. SQLite (unit tests) creates
+    tables fresh every run, so these statements are Postgres-only.
     """
     engine = get_engine()
     async with engine.begin() as conn:
         if engine.dialect.name == "postgresql":
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+        if engine.dialect.name == "postgresql":
+            # --- semantic_cache columns added after Phase 3 initial schema ----
+            await conn.execute(text(
+                "ALTER TABLE semantic_cache "
+                "ADD COLUMN IF NOT EXISTS prompt_hash VARCHAR(64)"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_semantic_cache_prompt_hash "
+                "ON semantic_cache (prompt_hash)"
+            ))
+            # --- traces columns added with request-tracing middleware ---------
+            await conn.execute(text(
+                "ALTER TABLE traces "
+                "ADD COLUMN IF NOT EXISTS request_id VARCHAR(36)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE traces "
+                "ADD COLUMN IF NOT EXISTS test_name VARCHAR(200)"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_traces_request_id "
+                "ON traces (request_id)"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_traces_test_name "
+                "ON traces (test_name)"
+            ))
     logger.info("database schema ensured")
 
 

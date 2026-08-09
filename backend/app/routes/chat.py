@@ -247,9 +247,27 @@ async def _streamed(body: dict):
         if first_chunk is not None:
             if out := await _out(first_chunk):
                 yield out
-        async for chunk in upstream_gen:
-            if out := await _out(chunk):
-                yield out
+        # W-1 fix: if the generator raises mid-relay (UpstreamError or any
+        # unexpected transport fault AFTER headers have been sent), we can no
+        # longer change the HTTP status — so we yield a terminal SSE error event
+        # that SSE-aware clients can detect, rather than letting the connection
+        # drop silently with no signal.
+        try:
+            async for chunk in upstream_gen:
+                if out := await _out(chunk):
+                    yield out
+        except UpstreamError as exc:
+            logger.error(
+                "stream failed mid-relay — sending terminal error event: %s", exc
+            )
+            result.error = result.error or str(exc)
+            yield b'data: {"error": "upstream crashed"}\n\n'
+        except Exception as exc:  # noqa: BLE001 — mid-stream failures must not silently truncate
+            logger.error(
+                "relay: unexpected error mid-stream %s: %s", type(exc).__name__, exc
+            )
+            result.error = result.error or f"{type(exc).__name__}: {exc}"
+            yield b'data: {"error": "upstream crashed"}\n\n'
         if unmasker is not None:
             try:
                 if tail := unmasker.flush():

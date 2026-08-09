@@ -46,7 +46,11 @@ export default function App() {
 
   const fetchTraces = useCallback(async () => {
     try {
-      const res = await fetch('/internal/traces')
+      // Authorization is injected by the Vite dev-server proxy (vite.config.ts)
+      // so the bearer token never enters the browser bundle.
+      const res = await fetch('/internal/traces', {
+        headers: { 'Content-Type': 'application/json' },
+      })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setTraces((await res.json()) as Trace[])
       setError(null)

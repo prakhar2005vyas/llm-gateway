@@ -76,11 +76,16 @@ class Server:
 
     async def __aenter__(self):
         self._task = asyncio.create_task(self._server.serve())
-        for _ in range(200):
+        # Boot budget must cover the gateway's lifespan warmup(), which loads
+        # the SentenceTransformer embedding model on the CPU (several seconds
+        # cold, from local disk cache). The old 4s window predated that warmup
+        # and spuriously timed out. Poll finely so a fast boot (the stub app,
+        # which has no lifespan) still returns immediately.
+        for _ in range(1500):  # 1500 * 0.02s = 30s ceiling
             if self._server.started:
                 return self
             await asyncio.sleep(0.02)
-        raise RuntimeError("uvicorn did not start")
+        raise RuntimeError("uvicorn did not start within 30s")
 
     async def __aexit__(self, *exc):
         self._server.should_exit = True

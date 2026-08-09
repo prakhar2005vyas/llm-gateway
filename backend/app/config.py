@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # --- Upstream provider (OpenAI-compatible) -------------------------------
     upstream_base_url: str = "https://api.openai.com/v1"
     upstream_api_key: str = ""
+    # When set, every forwarded request has its `model` field overwritten with
+    # this value. Handles provider migrations (e.g. Fireworks → Groq) without
+    # requiring clients to update their model strings. Empty = passthrough.
+    upstream_model_id: str = ""
 
     # --- Reliability knobs ---------------------------------------------------
     upstream_timeout_seconds: float = 60.0

@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
@@ -35,46 +34,30 @@ logger = logging.getLogger(__name__)
 # Transport-level faults worth retrying (DNS, connect, read timeout, ...).
 _RETRYABLE_EXC = (httpx.TransportError,)
 
-# Fireworks-style model paths: accounts/<org>/models/<name>
-_FIREWORKS_MODEL_RE = re.compile(r"^accounts/[^/]+/models/(.+)$")
 
 
 def _rewrite_model(body: dict) -> dict:
     """Return a copy of body with the model field normalised for the upstream.
 
-    Two cases:
-    * UPSTREAM_MODEL_ID is set → always use that value (explicit override;
-      handles provider migrations without client changes).
-    * UPSTREAM_MODEL_ID is empty → passthrough UNLESS the model looks like a
-      Fireworks path (accounts/<org>/models/<name>), in which case we strip
-      to the bare model name and warn — a Fireworks path is guaranteed wrong
-      on any other provider.
+    * UPSTREAM_MODEL_ID set   → force every request onto that model. One
+      unconditional override catches all legacy model strings (Fireworks
+      accounts/*/models/*, OpenAI ids, vision strings, …) so nothing
+      unexpected reaches the provider. A real deployment pins its model this
+      way: docker-compose.yml sets UPSTREAM_MODEL_ID for prod/demo.
+    * UPSTREAM_MODEL_ID empty → passthrough: forward the client's model string
+      verbatim. Never hardcode a model id here (CLAUDE.md: everything is
+      config-driven); an unconfigured gateway stays a transparent pipe.
     """
     settings = get_settings()
+    target = settings.upstream_model_id
+    if not target:
+        return body  # passthrough — no override configured
+
     incoming = body.get("model")
+    if incoming != target:
+        logger.info("model rewrite: '%s' -> '%s'", incoming, target)
 
-    if settings.upstream_model_id:
-        if incoming != settings.upstream_model_id:
-            logger.info(
-                "model rewrite: %r → %r (UPSTREAM_MODEL_ID override)",
-                incoming,
-                settings.upstream_model_id,
-            )
-        return {**body, "model": settings.upstream_model_id}
-
-    if isinstance(incoming, str):
-        m = _FIREWORKS_MODEL_RE.match(incoming)
-        if m:
-            bare = m.group(1)
-            logger.warning(
-                "model rewrite: Fireworks path %r stripped to %r "
-                "(set UPSTREAM_MODEL_ID to suppress this warning)",
-                incoming,
-                bare,
-            )
-            return {**body, "model": bare}
-
-    return body
+    return {**body, "model": target}
 
 
 class UpstreamError(Exception):

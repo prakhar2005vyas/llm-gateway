@@ -34,6 +34,7 @@ store → skipped. (Same boundary rule as tracing.py.)
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass
@@ -101,19 +102,76 @@ def is_cacheable_request(body: dict) -> bool:
     return not contains_pii(serialized)
 
 
-async def consult(body: dict) -> CacheDecision:
-    """Hot-path lookup: mask → embed → nearest-neighbor → threshold check.
+def _prompt_hash(model_id: str, masked_prompt: str) -> str:
+    """SHA-256 hex digest of '{model_id}:{masked_prompt}'.
 
-    Returns a CacheDecision; `hit` is set iff a same-model row clears the
-    similarity threshold. Never raises — cache failure degrades to a miss.
+    Used as an exact-match key before the pgvector similarity search so that
+    repeated identical prompts short-circuit without computing an embedding.
+    """
+    return hashlib.sha256(f"{model_id}:{masked_prompt}".encode()).hexdigest()
+
+
+async def _exact(model_id: str, hash_val: str) -> SemanticCache | None:
+    """Point lookup by prompt hash — O(1) index seek instead of a vector scan.
+
+    Returns None on any failure (missing column on an old schema, DB down, etc.)
+    so the caller always falls through to the vector path rather than surfacing
+    a cache error to the request. Failure is logged at DEBUG level only — it is
+    expected on a DB that pre-dates the prompt_hash column.
+    """
+    try:
+        async with session() as s:
+            return (
+                await s.execute(
+                    select(SemanticCache)
+                    .where(
+                        SemanticCache.model_id == model_id,
+                        SemanticCache.prompt_hash == hash_val,
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "exact-hash lookup failed (falling back to vector search): %s: %s",
+            type(exc).__name__, exc,
+        )
+        return None
+
+
+async def consult(body: dict) -> CacheDecision:
+    """Hot-path lookup: mask → exact hash → embed → nearest-neighbor → threshold.
+
+    Fast path: an SHA-256 point lookup is attempted before computing the vector
+    embedding. An exact match short-circuits the embedding entirely (similarity
+    reported as 1.0). Only on a hash miss does the full pgvector search run.
+
+    Returns a CacheDecision; `hit` is set iff a match is found. Never raises —
+    cache failure degrades to a miss.
     """
     if not is_cacheable_request(body):
         return CacheDecision(cacheable=False)
 
     try:
         masked = mask_prompt(serialize_messages(body))  # type: ignore[arg-type]
+        model_id = body["model"]
+
+        # Fast path: O(1) hash index lookup — no embedding needed on a hit.
+        hash_val = _prompt_hash(model_id, masked)
+        exact = await _exact(model_id, hash_val)
+        if exact is not None:
+            logger.info("cache HIT (exact hash, entry=%s)", exact.id)
+            return CacheDecision(
+                cacheable=True,
+                masked_prompt=masked,
+                embedding=None,  # not needed: cold-path store never runs on a hit
+                hit=exact,
+                similarity=1.0,
+            )
+
+        # Slow path: compute embedding and find nearest neighbour.
         embedding = await get_embedding(masked)
-        row, similarity = await _nearest(body["model"], embedding)
+        row, similarity = await _nearest(model_id, embedding)
 
         threshold = get_settings().cache_similarity_threshold
         if row is not None and similarity is not None and similarity >= threshold:
@@ -196,8 +254,11 @@ async def store(
 ) -> None:
     """Cold-path population. Upserts on exact (model, masked_prompt) match so
     repeated misses refresh one row instead of accumulating duplicates.
+    Writes prompt_hash so future identical prompts hit the O(1) fast path in
+    consult() without computing an embedding.
     Never raises (same boundary contract as record_trace)."""
     try:
+        hash_val = _prompt_hash(model_id, masked_prompt)
         async with session() as s:
             existing = (
                 await s.execute(
@@ -212,12 +273,14 @@ async def store(
             if existing is not None:
                 existing.response_body = response_body
                 existing.prompt_embedding = embedding
+                existing.prompt_hash = hash_val
             else:
                 s.add(
                     SemanticCache(
                         model_id=model_id,
                         masked_prompt=masked_prompt,
                         prompt_embedding=embedding,
+                        prompt_hash=hash_val,
                         response_body=response_body,
                     )
                 )

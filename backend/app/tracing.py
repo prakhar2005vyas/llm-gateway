@@ -28,6 +28,7 @@ from .costs import cost_for_model
 from .db import session
 from .metrics import REQUEST_COUNT, REQUEST_LATENCY, normalize_model_name
 from .models import ModelPrice, Trace
+from .request_context import get_request_id, get_test_name
 
 
 def _response_content(response_body: dict | None) -> str | None:
@@ -161,6 +162,11 @@ async def record_trace(
                         outcome=outcome,
                         error_message=error_message,
                         ttft_ms=ttft_ms,
+                        # Captured from ContextVars set by RequestTracingMiddleware.
+                        # BackgroundTasks run inline inside the ASGI app's __call__
+                        # before the middleware's finally block, so these are live.
+                        request_id=get_request_id(),
+                        test_name=get_test_name(),
                     )
                 )
 

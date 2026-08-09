@@ -125,6 +125,12 @@ class Trace(Base):
     outcome: Mapped[str] = mapped_column(String(32), nullable=False, default="ok")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Request-tracing context (middleware-stamped, Phase N). Both nullable so
+    # rows written before this column existed continue to work without migration.
+    # Indexed for "show me all traces from test X" queries.
+    request_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    test_name: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+
     __table_args__ = (
         # The dashboard's bread-and-butter query: model X over time window Y.
         Index("ix_traces_model_created", "model_id", "created_at"),
@@ -244,6 +250,14 @@ class SemanticCache(Base):
     model_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     # The complete OpenAI-shaped response a hit serves back.
     response_body: Mapped[dict] = mapped_column(nullable=False)
+
+    # SHA-256 hex digest of "{model_id}:{masked_prompt}" — enables an O(1)
+    # point lookup before the pgvector similarity search (Phase 3 fast path).
+    # Nullable for backward compatibility: rows written before this column
+    # existed carry NULL and fall through to the vector path gracefully.
+    prompt_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
 
     # Ops facts for the cache-hit-rate story.
     hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

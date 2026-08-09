@@ -227,7 +227,7 @@ async def record_trace(
         ):
             await asyncio.wait_for(
                 cache.store(
-                    model_id=request_body["model"],
+                    model_id=cache_decision.model_id,
                     masked_prompt=cache_decision.masked_prompt,
                     embedding=cache_decision.embedding,
                     response_body=response_body,  # type: ignore[arg-type]

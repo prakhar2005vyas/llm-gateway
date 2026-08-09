@@ -60,6 +60,7 @@ class CacheDecision:
     embedding: list[float] | None = None  # reused by the cold path store
     hit: SemanticCache | None = None
     similarity: float | None = None
+    model_id: str | None = None  # client's original model string for store parity
 
 
 def serialize_messages(body: dict) -> str | None:
@@ -84,22 +85,37 @@ def is_cacheable_request(body: dict) -> bool:
     """Deterministic, plain-text, known-model requests only (see module doc)."""
     settings = get_settings()
     if not settings.semantic_cache_enabled:
+        logger.debug("cache bypass: semantic_cache_enabled is False")
         return False
     temperature = body.get("temperature")
     if not isinstance(temperature, (int, float)) or isinstance(temperature, bool):
+        logger.debug(
+            "cache bypass: temperature missing or non-numeric (got %r) — "
+            "add explicit temperature ≤ %.1f to enable caching",
+            temperature, settings.cache_max_temperature,
+        )
         return False  # omitted temperature defaults to 1.0 upstream
     if temperature > settings.cache_max_temperature:
+        logger.debug(
+            "cache bypass: temperature %.2f > max %.2f",
+            temperature, settings.cache_max_temperature,
+        )
         return False
     if not isinstance(body.get("model"), str):
+        logger.debug("cache bypass: model field missing or not a string")
         return False
     serialized = serialize_messages(body)
     if serialized is None:
+        logger.debug("cache bypass: messages could not be serialized")
         return False
     # PII collision guard (Phase 5): different users' prompts can mask to the
     # IDENTICAL text ("my email is <EMAIL_1>") — caching one user's answer
     # under that key would serve it to the other. PII-bearing requests bypass
     # the cache entirely.
-    return not contains_pii(serialized)
+    if contains_pii(serialized):
+        logger.debug("cache bypass: prompt contains PII")
+        return False
+    return True
 
 
 def _prompt_hash(model_id: str, masked_prompt: str) -> str:
@@ -167,6 +183,7 @@ async def consult(body: dict) -> CacheDecision:
                 embedding=None,  # not needed: cold-path store never runs on a hit
                 hit=exact,
                 similarity=1.0,
+                model_id=model_id,
             )
 
         # Slow path: compute embedding and find nearest neighbour.
@@ -181,14 +198,14 @@ async def consult(body: dict) -> CacheDecision:
             )
             return CacheDecision(
                 cacheable=True, masked_prompt=masked, embedding=embedding,
-                hit=row, similarity=similarity,
+                hit=row, similarity=similarity, model_id=model_id,
             )
         logger.debug(
             "cache miss (best similarity=%s, threshold=%.2f)",
             f"{similarity:.4f}" if similarity is not None else "none",
             threshold,
         )
-        return CacheDecision(cacheable=True, masked_prompt=masked, embedding=embedding)
+        return CacheDecision(cacheable=True, masked_prompt=masked, embedding=embedding, model_id=model_id)
     except Exception as exc:  # noqa: BLE001 — cache must never break proxying
         logger.error(
             "CACHE LOOKUP FAILED (degrading to miss, request unaffected): %s: %s",

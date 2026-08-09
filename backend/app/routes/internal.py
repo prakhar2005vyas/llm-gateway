@@ -51,6 +51,7 @@ def _serialize(t: Trace) -> dict:
         "coalesced": t.coalesced,
         "outcome": t.outcome,
         "error_message": t.error_message,
+        "test_name": t.test_name,
     }
 
 

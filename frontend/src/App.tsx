@@ -17,6 +17,7 @@ interface Trace {
   coalesced: boolean
   outcome: string
   error_message: string | null
+  test_name: string | null
 }
 
 const POLL_MS = 5000
@@ -155,8 +156,13 @@ export default function App() {
                       </span>
                     )}
                     {t.coalesced && (
-                      <span className="rounded-full border border-blue-700 bg-blue-900/60 px-2 py-0.5 text-xs font-medium text-blue-300">
+                      <span className="mr-1 rounded-full border border-blue-700 bg-blue-900/60 px-2 py-0.5 text-xs font-medium text-blue-300">
                         Coalesced
+                      </span>
+                    )}
+                    {t.test_name && t.test_name !== 'default' && (
+                      <span className="rounded-full border border-purple-700 bg-purple-900/60 px-2 py-0.5 text-xs font-medium text-purple-300">
+                        {t.test_name}
                       </span>
                     )}
                   </td>

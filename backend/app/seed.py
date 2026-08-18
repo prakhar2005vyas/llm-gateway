@@ -38,6 +38,19 @@ logger = logging.getLogger(__name__)
 # table because that provider is flat-rate/GPU-time billed, not token-metered.
 # Do not add a price row for them without confirming Ollama has introduced
 # actual per-token billing.
+# WARNING: seed_model_prices() is insert-only — it will NOT update
+# prices for a model_id that already has a row in the database (see
+# test_seed_never_overwrites_operator_edits). If you change a price
+# here for an EXISTING model_id, you must also manually update any
+# already-seeded database:
+#
+#   docker compose exec postgres psql -U gateway -d gateway -c \
+#     "UPDATE model_prices SET usd_per_1k_input = X, usd_per_1k_output = Y
+#      WHERE model_id = 'the-model-id';"
+#
+# This bit us once: gpt-oss-120b's pricing was fixed here in code but
+# silently stayed wrong in the live DB, overcharging every real request
+# by ~2x until caught via Grafana cost data.
 BASELINE_PRICES: dict[str, tuple[Decimal, Decimal]] = {
     "gpt-4o-mini": (Decimal("0.00015"), Decimal("0.0006")),
     "gpt-4o": (Decimal("0.0025"), Decimal("0.01")),

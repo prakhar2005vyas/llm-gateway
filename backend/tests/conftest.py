@@ -30,6 +30,9 @@ def _reset_settings_cache(monkeypatch):
     # shed on purpose.
     monkeypatch.setenv("TRACE_WRITE_TIMEOUT_SECONDS", "120")
     monkeypatch.setenv("MODEL_ROUTES_JSON", "{}")  # Isolate from real .env
+    monkeypatch.setenv("EVAL_SAMPLE_RATE", "0.0")
+    monkeypatch.setenv("EVAL_BASE_URL", "")
+    monkeypatch.setenv("EVAL_API_KEY", "")
     
     get_settings.cache_clear()
     

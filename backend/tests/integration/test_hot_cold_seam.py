@@ -138,14 +138,14 @@ async def test_unpriced_model_traces_with_null_cost(client):
 @pytest.mark.parametrize("stream", [False, True])
 async def test_rewritten_model_cost_calculation(client, monkeypatch, stream):
     from app.config import get_settings
-    monkeypatch.setenv("UPSTREAM_MODEL_ID", "llama-3.3-70b-versatile")
+    monkeypatch.setenv("UPSTREAM_MODEL_ID", "openai/gpt-oss-120b")
     get_settings.cache_clear()
     
     # We add the price row for the REWRITTEN model.
     async with session() as s:
         s.add(
             ModelPrice(
-                model_id="llama-3.3-70b-versatile",
+                model_id="openai/gpt-oss-120b",
                 usd_per_1k_input=Decimal("0.00059"),
                 usd_per_1k_output=Decimal("0.00079"),
                 source="test seed",
@@ -156,22 +156,22 @@ async def test_rewritten_model_cost_calculation(client, monkeypatch, stream):
     if stream:
         # Provider responds with a snapshot ID in the chunks
         chunks = [
-            _delta_event("hi", model="llama-3.3-70b-versatile-0102"), 
-            _sse({"id": "c1", "model": "llama-3.3-70b-versatile-0102", "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}}), 
+            _delta_event("hi", model="openai/gpt-oss-120b-0102"), 
+            _sse({"id": "c1", "model": "openai/gpt-oss-120b-0102", "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}}), 
             DONE
         ]
         respx.post(UPSTREAM).mock(return_value=httpx.Response(200, stream=ChunkStream(chunks)))
     else:
-        resp_body = dict(_UPSTREAM_COMPLETION, model="llama-3.3-70b-versatile-0102")
+        resp_body = dict(_UPSTREAM_COMPLETION, model="openai/gpt-oss-120b-0102")
         respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=resp_body))
 
     r = await client.post("/v1/chat/completions", json=req_body)
     assert r.status_code == 200
 
     (t,) = await _all_traces()
-    # model_id in the trace MUST be the rewritten string ("llama-3.3-70b-versatile")
+    # model_id in the trace MUST be the rewritten string ("openai/gpt-oss-120b")
     # because that's what we have a price row for, NOT the snapshot ID, and NOT the client's string.
-    assert t.model_id == "llama-3.3-70b-versatile"
+    assert t.model_id == "openai/gpt-oss-120b"
     assert t.cost_usd == Decimal("0.00009850") # 100*0.00059 + 50*0.00079 = 0.059 + 0.0395 = 0.0985 per 1k = 0.0000985
 
 

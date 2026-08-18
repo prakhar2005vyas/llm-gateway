@@ -20,7 +20,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://gateway:${POSTGRES_PASSWORD:-gateway_dev_pw}@postgres:5432/gateway
       # Pinned explicitly so the rewrite fires even when .env is absent.
       # env_file supplies the same value; the environment block wins on conflict.
-      UPSTREAM_MODEL_ID: ${UPSTREAM_MODEL_ID:-llama-3.3-70b-versatile}
+      UPSTREAM_MODEL_ID: ${UPSTREAM_MODEL_ID:-openai/gpt-oss-120b}
     depends_on:
       postgres:
         condition: service_healthy

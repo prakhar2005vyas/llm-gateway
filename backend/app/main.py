@@ -115,6 +115,14 @@ async def health() -> dict:
                 api_key=route.get("api_key", ""),
             )
         )
+    if settings.failover_base_url:
+        all_providers.append(
+            Provider(
+                name="failover",
+                base_url=settings.failover_base_url,
+                api_key=settings.failover_api_key,
+            )
+        )
     
     async def check_provider(provider: Provider) -> tuple[str, str]:
         models_url = f"{provider.base_url.rstrip('/')}/models"

@@ -119,6 +119,21 @@ class TestCostForModel:
             got = cost_for_model(None, 100, 50, PRICES)
         assert got is None
 
+    def test_unmetered_model_returns_none_with_info_not_warning(self, caplog):
+        # A model in UNMETERED_MODELS produces None (unknown) without the noisy warning.
+        with caplog.at_level(logging.INFO, logger="app.costs"):
+            got = cost_for_model("gemma4:31b", 100, 50, PRICES)
+        
+        assert got is None
+        # It logs at INFO, not WARNING
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        
+        assert len(warning_records) == 0
+        assert len(info_records) == 1
+        assert "cost intentionally unknown" in info_records[0].message
+        assert "gemma4:31b" in info_records[0].message
+
     def test_missing_usage_returns_none_and_warns(self, caplog):
         # Upstream omitted `usage` — cost is unknown, not free.
         with caplog.at_level(logging.WARNING, logger="app.costs"):

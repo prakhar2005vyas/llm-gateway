@@ -251,8 +251,8 @@ async def test_stream_is_live_over_real_tcp(unused_tcp_port):
                 return_value=httpx.Response(200, stream=slow)
             )
 
-            # Wait for the socket to accept.
-            for _ in range(100):
+            # Wait for the socket to accept. (Increase to 300 to prevent flakiness on slow CI/Windows)
+            for _ in range(300):
                 if server.started:
                     break
                 await asyncio.sleep(0.02)

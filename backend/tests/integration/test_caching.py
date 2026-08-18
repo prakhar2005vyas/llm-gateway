@@ -105,7 +105,7 @@ async def _db(pg_url, monkeypatch):
         try:
             await init_db()
             break
-        except (ConnectionError, OSError):
+        except Exception as e:
             if time_mod.time() > deadline:
                 raise
             await dispose_db()  # drop the poisoned engine before retrying

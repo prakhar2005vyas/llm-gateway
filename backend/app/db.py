@@ -33,6 +33,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import sqlalchemy.exc
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -121,9 +122,15 @@ async def init_db() -> None:
     tables fresh every run, so these statements are Postgres-only.
     """
     engine = get_engine()
+    if engine.dialect.name == "postgresql":
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        except (sqlalchemy.exc.IntegrityError, sqlalchemy.exc.ProgrammingError) as e:
+            # Handle potential concurrent creation race conditions or permissions
+            logger.debug("CREATE EXTENSION vector ignored: %s", e)
+
     async with engine.begin() as conn:
-        if engine.dialect.name == "postgresql":
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
         if engine.dialect.name == "postgresql":
             # --- semantic_cache columns added after Phase 3 initial schema ----

@@ -49,7 +49,10 @@ async def gateway_client():
 
 
 @respx.mock
-async def test_sdk_gets_valid_completion(gateway_client):
+async def test_sdk_gets_valid_completion(gateway_client, monkeypatch):
+    from app.config import get_settings
+    monkeypatch.setenv("UPSTREAM_MODEL_ID", "")
+    get_settings.cache_clear()
     route = respx.post(UPSTREAM).mock(
         return_value=httpx.Response(200, json=_UPSTREAM_COMPLETION)
     )

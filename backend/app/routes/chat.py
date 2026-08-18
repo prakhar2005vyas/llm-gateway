@@ -101,6 +101,7 @@ async def _non_streamed(body: dict, force_eval: bool = False) -> JSONResponse:
                 status_code=200,
                 latency_ms=latency_ms,
                 outcome="ok",
+                provider="cache",
                 cache_decision=decision,  # → cache_hit=True, cost=0, hit stats
             ),
         )
@@ -120,13 +121,13 @@ async def _non_streamed(body: dict, force_eval: bool = False) -> JSONResponse:
     is_follower = False
     try:
         if coalesce.is_coalesceable(body):
-            (status_code, payload), is_leader = await coalesce.coalescer.get_or_run(
+            (status_code, payload, provider, rewritten_model), is_leader = await coalesce.coalescer.get_or_run(
                 coalesce.request_key(body),
                 lambda: forward_chat_completion(masked_body),
             )
             is_follower = not is_leader
         else:
-            status_code, payload = await forward_chat_completion(masked_body)
+            status_code, payload, provider, rewritten_model = await forward_chat_completion(masked_body)
     except UpstreamError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.error("forward failed: %s", exc)
@@ -162,6 +163,8 @@ async def _non_streamed(body: dict, force_eval: bool = False) -> JSONResponse:
             latency_ms=latency_ms,
             outcome="ok" if status_code < 400 else "upstream_error",
             error_message=None,
+            provider=provider,
+            rewritten_model=rewritten_model,
             cache_decision=decision,  # miss + ok response → cold-path store
             coalesced=is_follower,  # follower → cost 0; leader carries spend
             force_eval=force_eval,
@@ -213,7 +216,8 @@ async def _streamed(body: dict):
     # (normalized: unknown ids collapse to one bounded label value).
     try:
         TTFT_LATENCY.labels(
-            model=normalize_model_name(body.get("model"))
+            model=normalize_model_name(body.get("model")),
+            provider=result.provider or "unknown"
         ).observe(result.ttft_ms / 1000.0)
     except Exception as exc:  # noqa: BLE001 — metrics must never hurt the relay
         logger.error("TTFT metric update failed (non-fatal): %s: %s",

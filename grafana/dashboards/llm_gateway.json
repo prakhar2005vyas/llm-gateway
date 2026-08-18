@@ -17,8 +17,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (model, cache_hit) (rate(gateway_requests_total[5m]))",
-          "legendFormat": "{{model}} cache_hit={{cache_hit}}"
+          "expr": "sum by (model, cache_hit, provider) (rate(gateway_requests_total[5m]))",
+          "legendFormat": "{{provider}} {{model}} cache_hit={{cache_hit}}"
         }
       ]
     },
@@ -83,8 +83,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(gateway_failovers_total)",
-          "legendFormat": "retries+failovers"
+          "expr": "sum by (provider) (gateway_failovers_total)",
+          "legendFormat": "{{provider}} retries+failovers"
         }
       ]
     }

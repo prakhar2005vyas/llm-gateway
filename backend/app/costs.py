@@ -28,6 +28,10 @@ _CENT_PRECISION = Decimal("0.00000001")
 
 _TOKENS_PER_UNIT = Decimal(1000)  # prices are quoted per 1K tokens
 
+# Flat-rate / GPU-time billed models that do not have a per-token price.
+# cost_for_model will return None for these without logging a warning.
+UNMETERED_MODELS = frozenset(["gemma4:31b"])
+
 
 class PriceLike(Protocol):
     """Anything carrying the two per-1K rates (the ORM ModelPrice qualifies)."""
@@ -88,11 +92,17 @@ def cost_for_model(
         unmetered request is unknown, not free.
     """
     if model_id is None or model_id not in prices:
-        logger.warning(
-            "no price row for model %r — recording cost as unknown (NULL). "
-            "Add it to model_prices to keep cost aggregates complete.",
-            model_id,
-        )
+        if model_id in UNMETERED_MODELS:
+            logger.info(
+                "cost intentionally unknown: %r is a flat-rate provider, not token-metered",
+                model_id,
+            )
+        else:
+            logger.warning(
+                "no price row for model %r — recording cost as unknown (NULL). "
+                "Add it to model_prices to keep cost aggregates complete.",
+                model_id,
+            )
         return None
 
     if prompt_tokens is None or completion_tokens is None:

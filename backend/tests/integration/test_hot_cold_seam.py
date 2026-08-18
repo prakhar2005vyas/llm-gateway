@@ -64,6 +64,33 @@ async def _all_traces() -> list[Trace]:
         return list((await s.execute(select(Trace))).scalars().all())
 
 
+class ChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = chunks
+
+    async def __aiter__(self):
+        for c in self._chunks:
+            yield c
+
+
+def _sse(payload: dict) -> bytes:
+    import json
+    return b"data: " + json.dumps(payload, ensure_ascii=False).encode() + b"\n\n"
+
+
+def _delta_event(piece: str, finish: str | None = None, model: str = "gpt-4o-mini-2024-07-18") -> bytes:
+    return _sse(
+        {
+            "id": "c1",
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": finish}],
+        }
+    )
+
+
+DONE = b"data: [DONE]\n\n"
+
+
 @respx.mock
 async def test_success_writes_trace_with_hand_computed_cost(client):
     respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=_UPSTREAM_COMPLETION))
@@ -105,6 +132,69 @@ async def test_unpriced_model_traces_with_null_cost(client):
     assert t.model_id == "mystery-9000"
     assert t.cost_usd is None  # unknown, not zero
     assert t.total_tokens == 150  # usage still captured
+
+
+@respx.mock
+@pytest.mark.parametrize("stream", [False, True])
+async def test_rewritten_model_cost_calculation(client, monkeypatch, stream):
+    from app.config import get_settings
+    monkeypatch.setenv("UPSTREAM_MODEL_ID", "llama-3.3-70b-versatile")
+    get_settings.cache_clear()
+    
+    # We add the price row for the REWRITTEN model.
+    async with session() as s:
+        s.add(
+            ModelPrice(
+                model_id="llama-3.3-70b-versatile",
+                usd_per_1k_input=Decimal("0.00059"),
+                usd_per_1k_output=Decimal("0.00079"),
+                source="test seed",
+            )
+        )
+
+    req_body = {"model": "llama-3.1-8b-instant", "messages": [], "stream": stream}
+    if stream:
+        # Provider responds with a snapshot ID in the chunks
+        chunks = [
+            _delta_event("hi", model="llama-3.3-70b-versatile-0102"), 
+            _sse({"id": "c1", "model": "llama-3.3-70b-versatile-0102", "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}}), 
+            DONE
+        ]
+        respx.post(UPSTREAM).mock(return_value=httpx.Response(200, stream=ChunkStream(chunks)))
+    else:
+        resp_body = dict(_UPSTREAM_COMPLETION, model="llama-3.3-70b-versatile-0102")
+        respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=resp_body))
+
+    r = await client.post("/v1/chat/completions", json=req_body)
+    assert r.status_code == 200
+
+    (t,) = await _all_traces()
+    # model_id in the trace MUST be the rewritten string ("llama-3.3-70b-versatile")
+    # because that's what we have a price row for, NOT the snapshot ID, and NOT the client's string.
+    assert t.model_id == "llama-3.3-70b-versatile"
+    assert t.cost_usd == Decimal("0.00009850") # 100*0.00059 + 50*0.00079 = 0.059 + 0.0395 = 0.0985 per 1k = 0.0000985
+
+
+@respx.mock
+async def test_rewritten_model_without_price_warns_with_rewritten_name(client, monkeypatch, caplog):
+    from app.config import get_settings
+    import logging
+    monkeypatch.setenv("UPSTREAM_MODEL_ID", "mystery-rewritten-model")
+    get_settings.cache_clear()
+    
+    resp_body = dict(_UPSTREAM_COMPLETION, model="mystery-rewritten-model-snapshot")
+    respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=resp_body))
+
+    with caplog.at_level(logging.WARNING, logger="app.costs"):
+        r = await client.post("/v1/chat/completions", json={"model": "google/gemma-4-26B-A4B-it", "messages": []})
+    
+    assert r.status_code == 200
+    (t,) = await _all_traces()
+    assert t.model_id == "mystery-rewritten-model"
+    assert t.cost_usd is None
+    
+    # Must log with the REWRITTEN name ("mystery-rewritten-model"), not the original or snapshot.
+    assert any("no price row for model 'mystery-rewritten-model'" in rec.message for rec in caplog.records)
 
 
 @respx.mock

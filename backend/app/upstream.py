@@ -22,6 +22,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import httpx
 
@@ -36,26 +37,47 @@ _RETRYABLE_EXC = (httpx.TransportError,)
 
 
 
-def _rewrite_model(body: dict) -> dict:
+@lru_cache
+def _get_routes() -> dict:
+    settings = get_settings()
+    try:
+        routes = json.loads(settings.model_routes_json)
+        if not isinstance(routes, dict):
+            raise ValueError("model_routes_json must be a JSON object")
+        for route_name, route_config in routes.items():
+            if not isinstance(route_config, dict):
+                raise ValueError(f"route {route_name} must be a JSON object")
+            if "provider_label" not in route_config:
+                raise ValueError(f"route {route_name} missing required 'provider_label'")
+        return routes
+    except ValueError as exc:
+        raise ValueError(f"malformed MODEL_ROUTES_JSON: {exc}") from exc
+
+
+def _rewrite_model(body: dict, requested_model: str | None) -> dict:
     """Return a copy of body with the model field normalised for the upstream.
 
-    * UPSTREAM_MODEL_ID set   → force every request onto that model. One
-      unconditional override catches all legacy model strings (Fireworks
-      accounts/*/models/*, OpenAI ids, vision strings, …) so nothing
-      unexpected reaches the provider. A real deployment pins its model this
-      way: docker-compose.yml sets UPSTREAM_MODEL_ID for prod/demo.
-    * UPSTREAM_MODEL_ID empty → passthrough: forward the client's model string
-      verbatim. Never hardcode a model id here (CLAUDE.md: everything is
-      config-driven); an unconfigured gateway stays a transparent pipe.
+    * Routed model     → use its specific "model_id" override if configured.
+    * UPSTREAM_MODEL_ID set   → force every request onto that model.
+    * UPSTREAM_MODEL_ID empty → passthrough.
     """
+    routes = _get_routes()
+    if requested_model in routes:
+        route = routes[requested_model]
+        target = route.get("model_id")
+        if target:
+            if requested_model != target:
+                logger.info("model rewrite (routed): '%s' -> '%s'", requested_model, target)
+            return {**body, "model": target}
+        return body
+
     settings = get_settings()
     target = settings.upstream_model_id
     if not target:
         return body  # passthrough — no override configured
 
-    incoming = body.get("model")
-    if incoming != target:
-        logger.info("model rewrite: '%s' -> '%s'", incoming, target)
+    if requested_model != target:
+        logger.info("model rewrite: '%s' -> '%s'", requested_model, target)
 
     return {**body, "model": target}
 
@@ -69,12 +91,15 @@ def _backoff_seconds(attempt: int) -> float:
     return min(0.5 * (2**attempt), 8.0)
 
 
-def _count_failover(body: dict) -> None:
+def _count_failover(provider: Provider, body: dict) -> None:
     """Phase 7: bump the retry/failover counter. Called exactly where a
     retry is scheduled or a provider failover is logged. Never raises —
     metrics must never affect forwarding."""
     try:
-        FAILOVER_COUNT.labels(model=normalize_model_name(body.get("model"))).inc()
+        FAILOVER_COUNT.labels(
+            model=normalize_model_name(body.get("model")),
+            provider=provider.name,
+        ).inc()
     except Exception as exc:  # noqa: BLE001
         logger.error("failover metric update failed (non-fatal): %s: %s",
                      type(exc).__name__, exc)
@@ -87,6 +112,7 @@ class Provider:
     name: str
     base_url: str
     api_key: str
+    model_id: str | None = None
 
     @property
     def chat_url(self) -> str:
@@ -100,21 +126,39 @@ class Provider:
         }
 
 
-def providers() -> list[Provider]:
-    """Failover chain: primary, then the optional secondary (Phase 4).
-
-    Each provider gets its FULL retry budget before the chain advances.
-    Cross-schema targets (Anthropic) need a translation layer — DOCUMENT-ONLY.
+def providers(requested_model: str | None = None) -> list[Provider]:
+    """Resolve the upstream provider chain.
+    
+    If requested_model matches a route, returns just that provider (no failover).
+    Otherwise returns the default failover chain (primary, then optional secondary).
     """
+    routes = _get_routes()
+    if requested_model in routes:
+        route = routes[requested_model]
+        return [
+            Provider(
+                name=route["provider_label"],
+                base_url=route["base_url"],
+                api_key=route.get("api_key", ""),
+            )
+        ]
+
     s = get_settings()
     chain = [Provider("primary", s.upstream_base_url, s.upstream_api_key)]
     if s.failover_base_url:
-        chain.append(Provider("failover", s.failover_base_url, s.failover_api_key))
+        chain.append(
+            Provider(
+                "failover", 
+                s.failover_base_url, 
+                s.failover_api_key,
+                model_id=s.failover_model_id or None,
+            )
+        )
     return chain
 
 
-async def forward_chat_completion(body: dict) -> tuple[int, dict]:
-    """Forward through the provider chain and return (status, json).
+async def forward_chat_completion(body: dict) -> tuple[int, dict, str, str]:
+    """Forward through the provider chain and return (status, json, provider_name, rewritten_model).
 
     Per provider: retries transport errors and 5xx with backoff (Phase 0
     behavior, unchanged). When the PRIMARY fails completely — transport
@@ -127,14 +171,20 @@ async def forward_chat_completion(body: dict) -> tuple[int, dict]:
     transparently if one exists, else UpstreamError → the route's clean 502.
     """
     last_exc: Exception | None = None
-    last_5xx: tuple[int, dict] | None = None
-    body = _rewrite_model(body)
-    chain = providers()
+    last_5xx: tuple[int, dict, str, str] | None = None
+    requested_model = body.get("model")
+    body = _rewrite_model(body, requested_model)
+    chain = providers(requested_model)
 
     for provider in chain:
         is_last = provider is chain[-1]
+        
+        attempt_body = body
+        if provider.model_id:
+            attempt_body = {**body, "model": provider.model_id}
+
         try:
-            status, payload = await _forward_via(provider, body)
+            status, payload = await _forward_via(provider, attempt_body)
         except UpstreamError as exc:
             last_exc = exc
             if not is_last:
@@ -142,19 +192,19 @@ async def forward_chat_completion(body: dict) -> tuple[int, dict]:
                     "provider %r unreachable after all retries — FAILING OVER: %s",
                     provider.name, exc,
                 )
-                _count_failover(body)
+                _count_failover(provider, attempt_body)
             continue
         if status >= 500 and not is_last:
-            last_5xx = (status, payload)
+            last_5xx = (status, payload, provider.name, attempt_body.get("model"))
             logger.error(
                 "provider %r still %d after all retries — FAILING OVER",
                 provider.name, status,
             )
-            _count_failover(body)
+            _count_failover(provider, attempt_body)
             continue
         if provider.name != "primary":
             logger.warning("request served by %r provider", provider.name)
-        return status, payload
+        return status, payload, provider.name, attempt_body.get("model")
 
     if last_5xx is not None:
         return last_5xx
@@ -192,7 +242,7 @@ async def _forward_via(provider: Provider, body: dict) -> tuple[int, dict]:
                     return resp.status_code, _safe_json(resp)
 
             if attempt < max_tries - 1:
-                _count_failover(body)  # a retry is now committed to
+                _count_failover(provider, body)  # a retry is now committed to
                 await asyncio.sleep(_backoff_seconds(attempt))
 
     raise UpstreamError(
@@ -249,6 +299,10 @@ class StreamResult:
     # Filled by the route's TTFT wrapper: ms from request start to the first
     # byte relayed to the client (the Phase 2 headline metric).
     ttft_ms: int | None = None
+    # Identifies which upstream provider actually served this request.
+    provider: str | None = None
+    # The actual model string sent upstream (after rewriting), used for price lookups.
+    rewritten_model: str | None = None
 
     @property
     def content(self) -> str:
@@ -318,19 +372,26 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
     settings = get_settings()
     max_tries = settings.upstream_max_retries + 1
     last_exc: Exception | None = None
-    body = _rewrite_model(body)
-    chain = providers()
+    requested_model = body.get("model")
+    body = _rewrite_model(body, requested_model)
+    chain = providers(requested_model)
 
     for provider in chain:
         is_last = provider is chain[-1]
         headers = dict(provider.headers, Accept="text/event-stream")
         failed_over = False
+        
+        attempt_body = body
+        if provider.model_id:
+            attempt_body = {**body, "model": provider.model_id}
+            
+        result.rewritten_model = attempt_body.get("model")
 
         async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:
             for attempt in range(max_tries):
                 try:
                     async with client.stream(
-                        "POST", provider.chat_url, json=body, headers=headers
+                        "POST", provider.chat_url, json=attempt_body, headers=headers
                     ) as resp:
                         if resp.status_code >= 500 and attempt < max_tries - 1:
                             await resp.aread()  # drain; do NOT relay a retryable 5xx
@@ -345,12 +406,13 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
                                 "stream: provider %r still %d after all retries "
                                 "— FAILING OVER", provider.name, resp.status_code,
                             )
-                            _count_failover(body)
+                            _count_failover(provider, attempt_body)
                             failed_over = True
                             break
                         elif resp.status_code >= 400:
                             # Terminal error status: relay body as-is, no retry.
                             result.status_code = resp.status_code
+                            result.provider = provider.name
                             yield await resp.aread()
                             return
                         else:
@@ -359,6 +421,7 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
                                     "stream served by %r provider", provider.name
                                 )
                             result.status_code = resp.status_code
+                            result.provider = provider.name
                             async for chunk in _relay(resp, result):
                                 yield chunk
                             return
@@ -376,7 +439,7 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
                         provider.name, attempt + 1, max_tries, exc,
                     )
                 if attempt < max_tries - 1:
-                    _count_failover(body)  # a retry is now committed to
+                    _count_failover(provider, attempt_body)  # a retry is now committed to
                     await asyncio.sleep(_backoff_seconds(attempt))
 
         if not is_last and not failed_over:
@@ -384,7 +447,7 @@ async def forward_stream(body: dict, result: StreamResult) -> AsyncIterator[byte
                 "stream: provider %r unreachable after all retries — FAILING OVER: %s",
                 provider.name, last_exc,
             )
-            _count_failover(body)
+            _count_failover(provider, attempt_body)
 
     raise UpstreamError(
         f"all {len(chain)} provider(s) unreachable for stream: {last_exc}"

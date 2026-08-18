@@ -29,7 +29,7 @@ def _fast_backoff(monkeypatch):
 @respx.mock
 async def test_happy_path_forwards_and_returns_json():
     route = respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=_COMPLETION))
-    status, payload = await forward_chat_completion({"model": "m", "messages": []})
+    status, payload, _, _ = await forward_chat_completion({"model": "m", "messages": []})
     assert status == 200
     assert payload == _COMPLETION
     # The upstream key is attached, request body forwarded verbatim.
@@ -42,7 +42,7 @@ async def test_4xx_is_forwarded_not_retried():
     route = respx.post(UPSTREAM).mock(
         return_value=httpx.Response(400, json={"error": {"message": "bad"}})
     )
-    status, payload = await forward_chat_completion({"model": "m", "messages": []})
+    status, payload, _, _ = await forward_chat_completion({"model": "m", "messages": []})
     assert status == 400
     assert route.call_count == 1  # 4xx is the client's problem — no retry
     assert payload["error"]["message"] == "bad"
@@ -56,7 +56,7 @@ async def test_5xx_is_retried_then_succeeds():
             httpx.Response(200, json=_COMPLETION),
         ]
     )
-    status, _ = await forward_chat_completion({"model": "m", "messages": []})
+    status, _, _, _ = await forward_chat_completion({"model": "m", "messages": []})
     assert status == 200
     assert route.call_count == 2
 
@@ -74,7 +74,7 @@ async def test_transport_error_retried_then_raises_upstream_error():
 @respx.mock
 async def test_exhausted_5xx_returns_last_response():
     route = respx.post(UPSTREAM).mock(return_value=httpx.Response(500, json={"error": "x"}))
-    status, _ = await forward_chat_completion({"model": "m", "messages": []})
+    status, _, _, _ = await forward_chat_completion({"model": "m", "messages": []})
     # After exhausting retries we return the final 5xx transparently, not raise.
     assert status == 500
     assert route.call_count == get_settings().upstream_max_retries + 1

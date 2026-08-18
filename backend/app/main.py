@@ -18,6 +18,9 @@ from .middleware import RequestTracingMiddleware
 from .request_context import RequestContextFilter
 from .routes import chat, internal
 from .seed import seed_model_prices
+from .upstream import Provider, _get_routes, providers
+import httpx
+import asyncio
 
 settings = get_settings()
 
@@ -102,4 +105,30 @@ async def metrics() -> Response:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "version": app.version}
+    all_providers = providers()
+    routes = _get_routes()
+    for route in routes.values():
+        all_providers.append(
+            Provider(
+                name=route.get("provider_label", "routed"),
+                base_url=route["base_url"],
+                api_key=route.get("api_key", ""),
+            )
+        )
+    
+    async def check_provider(provider: Provider) -> tuple[str, str]:
+        models_url = f"{provider.base_url.rstrip('/')}/models"
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(models_url, headers=provider.headers)
+                return provider.name, "ok" if resp.status_code == 200 else f"error {resp.status_code}"
+        except Exception as exc:
+            return provider.name, f"error {type(exc).__name__}"
+    
+    results = await asyncio.gather(*(check_provider(p) for p in all_providers))
+    
+    status_dict = {}
+    for name, stat in results:
+        status_dict[name] = stat
+    
+    return {"status": "ok", "version": app.version, "providers": status_dict}

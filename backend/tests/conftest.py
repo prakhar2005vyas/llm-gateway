@@ -16,6 +16,10 @@ def _reset_settings_cache(monkeypatch):
     monkeypatch.setenv("UPSTREAM_BASE_URL", "https://upstream.test/v1")
     monkeypatch.setenv("UPSTREAM_API_KEY", "test-upstream-key")
     monkeypatch.setenv("GATEWAY_API_KEY", "")
+    monkeypatch.setenv("UPSTREAM_MODEL_ID", "")
+    monkeypatch.setenv("FAILOVER_BASE_URL", "")
+    monkeypatch.setenv("FAILOVER_API_KEY", "")
+    monkeypatch.setenv("FAILOVER_MODEL_ID", "")
     # Hermetic DB default: no test may ever require (or accidentally reach)
     # a real Postgres. Tests that need rows override/reset via app.db helpers.
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -25,7 +29,12 @@ def _reset_settings_cache(monkeypatch):
     # shed mid-test. The frozen-DB chaos test overrides this to exercise the
     # shed on purpose.
     monkeypatch.setenv("TRACE_WRITE_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("MODEL_ROUTES_JSON", "{}")  # Isolate from real .env
+    
     get_settings.cache_clear()
+    
+    from app.upstream import _get_routes
+    _get_routes.cache_clear()
     # The rate limiter is a process-wide singleton; without a reset, requests
     # accumulate across tests inside one monotonic window and unrelated tests
     # start drawing 429s.
@@ -34,3 +43,4 @@ def _reset_settings_cache(monkeypatch):
     limiter.reset_for_tests()
     yield
     get_settings.cache_clear()
+    _get_routes.cache_clear()

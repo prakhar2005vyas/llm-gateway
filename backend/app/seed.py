@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 #   gemini-1.5-flash:               $0.075/1M in, $0.30/1M out
 #   gemini-2.0-flash:               $0.10/1M in, $0.40/1M out
 #   llama3 (Ollama, local):         $0
+# NOTE: Ollama Cloud models (e.g. gemma4:31b) are intentionally absent from this
+# table because that provider is flat-rate/GPU-time billed, not token-metered.
+# Do not add a price row for them without confirming Ollama has introduced
+# actual per-token billing.
 BASELINE_PRICES: dict[str, tuple[Decimal, Decimal]] = {
     "gpt-4o-mini": (Decimal("0.00015"), Decimal("0.0006")),
     "gpt-4o": (Decimal("0.0025"), Decimal("0.01")),

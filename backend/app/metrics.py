@@ -24,7 +24,7 @@ def normalize_model_name(model: object) -> str:
 REQUEST_COUNT = Counter(
     "gateway_requests_total",
     "Total number of requests processed by the gateway",
-    ["model", "status_code", "cache_hit"]
+    ["model", "status_code", "cache_hit", "provider"]
 )
 
 # Bucket tuning: prometheus-client's defaults top out at 10s — LLM
@@ -35,19 +35,19 @@ REQUEST_COUNT = Counter(
 REQUEST_LATENCY = Histogram(
     "gateway_request_latency_seconds",
     "Total time taken to process a request",
-    ["model", "status_code"],
+    ["model", "status_code", "provider"],
     buckets=[0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, float("inf")],
 )
 
 TTFT_LATENCY = Histogram(
     "gateway_ttft_seconds",
     "Time to first token for streaming requests",
-    ["model"],
+    ["model", "provider"],
     buckets=[0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.5, 5.0, float("inf")],
 )
 
 FAILOVER_COUNT = Counter(
     "gateway_failovers_total",
     "Total number of times the gateway retried or failed over",
-    ["model"]
+    ["model", "provider"]
 )

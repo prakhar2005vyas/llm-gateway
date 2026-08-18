@@ -55,7 +55,7 @@ async def test_dead_primary_transport_fails_over():
     primary = respx.post(PRIMARY).mock(side_effect=httpx.ConnectError("refused"))
     failover = respx.post(FAILOVER).mock(return_value=httpx.Response(200, json=COMPLETION))
 
-    status, payload = await forward_chat_completion({"model": "m", "messages": []})
+    status, payload, _, _ = await forward_chat_completion({"model": "m", "messages": []})
 
     assert status == 200
     assert payload["choices"][0]["message"]["content"] == "from failover"
@@ -71,7 +71,7 @@ async def test_persistent_5xx_fails_over():
     primary = respx.post(PRIMARY).mock(return_value=httpx.Response(503))
     failover = respx.post(FAILOVER).mock(return_value=httpx.Response(200, json=COMPLETION))
 
-    status, _ = await forward_chat_completion({"model": "m", "messages": []})
+    status, _, _, _ = await forward_chat_completion({"model": "m", "messages": []})
     assert status == 200
     assert primary.call_count == 2  # 503, retried 503, then chain advance
     assert failover.call_count == 1
@@ -84,7 +84,7 @@ async def test_4xx_never_fails_over():
     )
     failover = respx.post(FAILOVER).mock(return_value=httpx.Response(200, json=COMPLETION))
 
-    status, payload = await forward_chat_completion({"model": "m", "messages": []})
+    status, payload, _, _ = await forward_chat_completion({"model": "m", "messages": []})
     assert status == 401
     assert payload["error"]["message"] == "bad key"
     assert failover.call_count == 0  # client errors are not retargeted
@@ -105,7 +105,7 @@ async def test_both_providers_5xx_returns_last_body_transparently():
     respx.post(PRIMARY).mock(return_value=httpx.Response(503, json={"error": "p"}))
     respx.post(FAILOVER).mock(return_value=httpx.Response(502, json={"error": "f"}))
 
-    status, payload = await forward_chat_completion({"model": "m", "messages": []})
+    status, payload, _, _ = await forward_chat_completion({"model": "m", "messages": []})
     assert status == 502  # the last provider's honest answer, not a synthetic
     assert payload == {"error": "f"}
 
@@ -119,6 +119,28 @@ async def test_no_failover_configured_preserves_phase0_behavior(monkeypatch):
     with pytest.raises(UpstreamError):
         await forward_chat_completion({"model": "m", "messages": []})
     assert primary.call_count == 2
+
+
+@respx.mock
+async def test_failover_model_id_rewrites_body_and_returns_rewritten_model(monkeypatch):
+    monkeypatch.setenv("UPSTREAM_MODEL_ID", "primary-model")
+    monkeypatch.setenv("FAILOVER_MODEL_ID", "failover-model")
+    get_settings.cache_clear()
+    
+    primary = respx.post(PRIMARY).mock(side_effect=httpx.ConnectError("refused"))
+    failover = respx.post(FAILOVER).mock(return_value=httpx.Response(200, json=COMPLETION))
+
+    status, payload, provider_name, rewritten_model = await forward_chat_completion(
+        {"model": "client-model", "messages": []}
+    )
+
+    assert status == 200
+    assert provider_name == "failover"
+    assert rewritten_model == "failover-model"  # Must match the failover's target model
+    
+    # Assert actual requests
+    assert json.loads(primary.calls.last.request.content)["model"] == "primary-model"
+    assert json.loads(failover.calls.last.request.content)["model"] == "failover-model"
 
 
 # ---------------------------------------------------------------------------
@@ -181,3 +203,28 @@ async def test_midstream_death_does_NOT_fail_over():
     assert failover.call_count == 0  # THE assertion
     assert result.error and "interrupted" in result.error
     assert result.content == "par"
+
+
+@respx.mock
+async def test_stream_failover_model_id_rewrites_body_and_sets_rewritten_model(monkeypatch):
+    monkeypatch.setenv("UPSTREAM_MODEL_ID", "primary-model")
+    monkeypatch.setenv("FAILOVER_MODEL_ID", "failover-model")
+    get_settings.cache_clear()
+
+    primary = respx.post(PRIMARY).mock(side_effect=httpx.ConnectError("refused"))
+    failover = respx.post(FAILOVER).mock(
+        return_value=httpx.Response(200, stream=ChunkStream([sse_event("hi")]))
+    )
+
+    result = StreamResult()
+    chunks = [c async for c in forward_stream({"model": "client-model", "stream": True}, result)]
+
+    assert primary.call_count == 2 and failover.call_count == 1
+    assert result.content == "hi"
+    assert result.status_code == 200
+    assert result.provider == "failover"
+    assert result.rewritten_model == "failover-model"  # Must match the failover's target model
+    
+    # Assert actual requests
+    assert json.loads(primary.calls.last.request.content)["model"] == "primary-model"
+    assert json.loads(failover.calls.last.request.content)["model"] == "failover-model"

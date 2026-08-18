@@ -79,6 +79,8 @@ async def record_trace(
     outcome: str,
     error_message: str | None = None,
     ttft_ms: int | None = None,
+    provider: str | None = None,
+    rewritten_model: str | None = None,
     cache_decision: "CacheDecision | None" = None,
     coalesced: bool = False,
     force_eval: bool = False,
@@ -95,12 +97,12 @@ async def record_trace(
     trace_id = uuid.uuid4()
     is_cache_hit = cache_decision is not None and cache_decision.hit is not None
 
-    # The client asked for this model id, and the price table is keyed by
-    # what clients ask for ("gpt-4o-mini"), not the resolved snapshot id
-    # the provider reports back ("gpt-4o-mini-2024-07-18"). Fall back to
-    # the response's id only when the request had none.
-    model_id: str | None = None
-    if isinstance(request_body, dict):
+    # For price lookups, use the actual model string we sent upstream (rewritten_model),
+    # since provider responses often contain snapshot IDs (e.g. gpt-4o-mini-2024-07-18)
+    # which won't match our alias-keyed model_prices table.
+    # We still fallback to request_body if it's missing (e.g. errors before rewriting).
+    model_id: str | None = rewritten_model
+    if model_id is None and isinstance(request_body, dict):
         model_id = request_body.get("model") or None
     if model_id is None and isinstance(response_body, dict):
         model_id = response_body.get("model") or None
@@ -111,14 +113,16 @@ async def record_trace(
     try:
         model_label = normalize_model_name(model_id)
         status_label = str(status_code) if status_code is not None else "none"
+        provider_label = provider or "unknown"
         REQUEST_COUNT.labels(
             model=model_label,
             status_code=status_label,
             cache_hit=str(is_cache_hit).lower(),
+            provider=provider_label,
         ).inc()
         if latency_ms is not None:
             REQUEST_LATENCY.labels(
-                model=model_label, status_code=status_label
+                model=model_label, status_code=status_label, provider=provider_label
             ).observe(latency_ms / 1000.0)
     except Exception as exc:  # noqa: BLE001 — metrics must never hurt tracing
         logger.error("metrics update failed (non-fatal): %s: %s",
@@ -291,6 +295,8 @@ async def record_stream_trace(
         outcome=outcome,
         error_message=result.error,
         ttft_ms=result.ttft_ms,
+        provider=result.provider,
+        rewritten_model=result.rewritten_model,
     )
 
     # Cache population from streams (Phase 3). Streams skip the hot-path

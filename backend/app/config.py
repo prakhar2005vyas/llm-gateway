@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     # requiring clients to update their model strings. Empty = passthrough.
     upstream_model_id: str = ""
 
+    # --- Routing (Phase 8) ---------------------------------------------------
+    # JSON object mapping requested model strings to dedicated upstream routes:
+    # {"model_string": {"base_url": "...", "api_key": "...", "model_id": "...", "provider_label": "..."}}
+    model_routes_json: str = "{}"
+
     # --- Reliability knobs ---------------------------------------------------
     upstream_timeout_seconds: float = 60.0
     # Number of *retries* after the first attempt (so total tries = retries + 1).
@@ -39,6 +44,7 @@ class Settings(BaseSettings):
     # failover is DOCUMENT-ONLY in SCALING.md.
     failover_base_url: str = ""
     failover_api_key: str = ""
+    failover_model_id: str = ""
 
     # --- Rate limiting (Phase 4) -------------------------------------------------
     # In-memory per-key sliding window (v1, single-process; distributed
